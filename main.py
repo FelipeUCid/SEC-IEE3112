@@ -1,1329 +1,794 @@
-import warnings
-import pandas as pd
-warnings.filterwarnings("ignore", category=UserWarning)
+import sys
+import io
+import contextlib
+import traceback
+from datetime import datetime
 
-# ── CONFIGURACIÓN ────────────────────────────────────────────────────────────────
-EXCEL_PATH  = "base_recl_LectorBLT_IA.xlsx"
-Q_MIN       = 1.0     # Umbral mínimo calidad_score  (pendiente calibración)
-MAX_BOLETAS = 24      # Máximo de boletas históricas a considerar
+from PyQt5.QtCore import Qt, QThread, pyqtSignal
+from PyQt5.QtGui import QFont, QColor, QTextCursor, QIcon
+from PyQt5.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
+    QLabel, QLineEdit, QPushButton, QProgressBar, QPlainTextEdit, QFrame,
+    QGroupBox, QSizePolicy, QScrollArea, QMessageBox, QSpacerItem
+)
 
-TIPOLOGIA_MAP = {
-    "facturación provisoria":       "T1",
-    "facturacion provisoria":       "T1",
-    "facturación excesiva":         "T2",
-    "facturacion excesiva":         "T2",
-    "cobros indebidos":             "T3",
-    "cobros indebidos — intereses": "T3",
-    "cobros indebidos - intereses": "T3",
-    "error de lectura":             "T4",
-    "problemas de lectura":         "T4",
-    "no clasificable":              "T5",
+from Extractor     import extraer,   ID_REFERENCIA as ID_REFERENCIA_DEFAULT, ID_PENDIENTES
+from Clasificador  import clasificar
+from LectorBoletas import analizar,  EXCEL_PATH, TIPOLOGIA_NOMBRE
+
+
+# ── ID DE INCIDENTE POR DEFECTO (HARDCODEADO) ────────────────────────────────────
+# El Excel de boletas se filtra por "ID de incidente". Se deja un valor por
+# defecto para agilizar pruebas; el usuario puede sobreescribirlo en la GUI.
+ID_INCIDENTE_DEFAULT = "2835115"
+
+
+# ── PALETA Y ESTILOS ──────────────────────────────────────────────────────────────
+
+COLOR_BG          = "#0f1117"
+COLOR_PANEL       = "#161922"
+COLOR_PANEL_ALT   = "#1b1f2a"
+COLOR_BORDER      = "#2a2f3d"
+COLOR_TEXT        = "#e6e9ef"
+COLOR_TEXT_DIM    = "#8b93a7"
+COLOR_ACCENT      = "#3b82f6"
+COLOR_ACCENT_DIM  = "#1e3a5f"
+COLOR_GREEN       = "#22c55e"
+COLOR_RED         = "#ef4444"
+COLOR_YELLOW      = "#eab308"
+COLOR_ORANGE      = "#f97316"
+COLOR_GREY        = "#6b7280"
+
+ESTADO_COLOR = {
+    "VALIDADO_PARA_DESPACHO":    COLOR_GREEN,
+    "CLASIFICADO_PARA_REVISION": COLOR_YELLOW,
+    "NO_EVALUABLE":              COLOR_GREY,
+    "BLOQUEADO_POR_CONTROL":     COLOR_RED,
+    "SIN_SENAL_COMPATIBLE":      COLOR_ORANGE,
 }
 
-TIPOLOGIA_NOMBRE = {
-    "T1": "Facturación Provisoria",
-    "T2": "Facturación Excesiva",
-    "T3": "Cobros Indebidos — Intereses",
-    "T4": "Error de Lectura",
-    "T5": "No Clasificable",
-}
-
-PERFILES_ELEGIBLES = {"C1", "C6", "C8", "C13"}
-
-PERFIL_TIPOLOGIA = {
-    "C1": "T1", "C2": "T1", "C3": "T1", "C4": "T1", "C5": "T1",
-    "C6": "T2", "C7": "T2", "C8": "T2", "C9": "T2", "C10": "T2",
-    "C11": "T3", "C12": "T3",
-    "C13": "T4", "C14": "T4",
-}
-
-PERFIL_ROL = {
-    "C1":  "Primario ELEGIBLE_PARA_DESPACHO — Facturación Provisoria",
-    "C2":  "Modificador de C1 — Abono devolución provisoria",
-    "C3":  "Alerta / revisión — Señal temprana sin lectura",
-    "C4":  "Modificador / revisión — Sin lectura + ciclo irregular",
-    "C5":  "Contexto — Cliente especial con estimación",
-    "C6":  "Primario ELEGIBLE_PARA_DESPACHO — Facturación Excesiva interanual ≥100%",
-    "C7":  "Alerta técnica / revisión — Consumo excede potencia contratada",
-    "C8":  "Primario ELEGIBLE_PARA_DESPACHO — Outlier + aumento mensual ≥100%",
-    "C9":  "Alerta técnica / revisión — Aumento interanual ≥30% cercano a potencia",
-    "C10": "Revisión experta — Cambio de medidor + aumento ≥30%",
-    "C11": "Revisión experta — Intereses con tasa alta",
-    "C12": "Modificador de C11 — Saldo anterior pendiente",
-    "C13": "Primario ELEGIBLE_PARA_DESPACHO — Error de Lectura por ciclo irregular",
-    "C14": "Alerta / revisión — Consumo cero o negativo",
-}
+MONO_FONT = "Consolas, 'Cascadia Mono', 'Courier New', monospace"
 
 
-# ── HELPERS DE LECTURA SEGURA ────────────────────────────────────────────────────
+# ── HILO DE TRABAJO ───────────────────────────────────────────────────────────────
 
-def _get(row: pd.Series, col: str, default=None):
-    """Acceso seguro a una celda de pandas Series; retorna default si no existe o es NaN."""
-    try:
-        val = row[col]
-        if pd.isna(val):
-            return default
-        return val
-    except (KeyError, TypeError):
-        return default
-
-
-def _bool(row: pd.Series, col: str) -> bool:
-    """Lee una celda booleana de forma segura desde una pandas Series."""
-    val = _get(row, col, False)
-    if isinstance(val, bool):
-        return val
-    if isinstance(val, (int, float)):
-        return bool(val)
-    if isinstance(val, str):
-        return val.strip().lower() in ("true", "1", "sí", "si", "yes")
-    return False
-
-
-def _num(row: pd.Series, col: str, default: float = 0.0) -> float:
-    """Lee una celda numérica de forma segura desde una pandas Series."""
-    val = _get(row, col, default)
-    try:
-        return float(val)
-    except (TypeError, ValueError):
-        return default
-
-
-def _pct(valor: float) -> str:
-    """Formatea un decimal como porcentaje con 1 decimal."""
-    return f"{valor * 100:.1f}%"
-
-
-# ── CARGA Y FILTRADO DEL EXCEL ───────────────────────────────────────────────────
-
-def _cargar_boletas(excel_path: str, ID_REFERENCIA: str) -> tuple:
+class PipelineWorker(QThread):
     """
-    Carga el Excel, localiza el cliente por ID de incidente y retorna:
-        df_cliente   — hasta MAX_BOLETAS boletas del cliente, ordenadas desc.
-        df_reclamada — fila(s) marcadas como 'es boleta reclamada'
-    Lanza ValueError si el caso no existe en el Excel.
+    Ejecuta Extractor → Clasificador → LectorBoletas en un hilo separado
+    para no bloquear la interfaz. Cada etapa captura su propio stdout en un
+    buffer local (io.StringIO) — NUNCA se modifica sys.stdout global, para
+    evitar condiciones de carrera con el hilo principal de Qt — y emite el
+    bloque completo de log al finalizar esa etapa (éxito o error).
     """
-    df = pd.read_excel(excel_path)
+    log_emitted      = pyqtSignal(str)
+    stage_started    = pyqtSignal(int, str)     # (índice de etapa, nombre)
+    stage_finished   = pyqtSignal(int)          # índice de etapa completada
+    finished_ok      = pyqtSignal(dict)         # resultado final completo
+    finished_error    = pyqtSignal(str, str)     # (etapa, mensaje de error)
 
-    # Normalizar columna de ID a string
-    df["ID de incidente"] = df["ID de incidente"].astype(str).str.strip()
-    mask = df["ID de incidente"] == str(ID_REFERENCIA).strip()
+    def __init__(self, n_referencia: str, id_incidente: str, id_pendientes: int, excel_path: str):
+        super().__init__()
+        self.n_referencia  = n_referencia
+        self.id_incidente  = id_incidente
+        self.id_pendientes = id_pendientes
+        self.excel_path    = excel_path
 
-    if not mask.any():
-        raise ValueError(
-            f"Caso {ID_REFERENCIA} no encontrado en '{excel_path}'. "
-            f"Verifique que el ID de incidente exista en el Excel."
+    def run(self):
+        try:
+            # ── ETAPA 1 — EXTRACTOR ──────────────────────────────────────────────
+            self.stage_started.emit(0, "Extractor SEC")
+            buf = io.StringIO()
+            try:
+                with contextlib.redirect_stdout(buf):
+                    datos_caso = extraer(
+                        ID_REFERENCIA=self.n_referencia,
+                        id_pendientes=self.id_pendientes,
+                    )
+            except Exception as e:
+                self.log_emitted.emit(buf.getvalue())
+                raise RuntimeError(f"[Extractor] {e}") from e
+            self.log_emitted.emit(buf.getvalue())
+            self.stage_finished.emit(0)
+
+            # Forzar que el ID de incidente usado por el lector sea el indicado
+            # por el usuario en la GUI (puede diferir del que retorna SEC si se
+            # desea apuntar manualmente a otra fila del Excel).
+            if self.id_incidente:
+                datos_caso = dict(datos_caso)
+                datos_caso["_id_incidente_excel"] = self.id_incidente
+
+            # ── ETAPA 2 — CLASIFICADOR ───────────────────────────────────────────
+            self.stage_started.emit(1, "Clasificador IA")
+            buf = io.StringIO()
+            try:
+                with contextlib.redirect_stdout(buf):
+                    clasificacion = clasificar(datos_caso)
+            except Exception as e:
+                self.log_emitted.emit(buf.getvalue())
+                raise RuntimeError(f"[Clasificador] {e}") from e
+            self.log_emitted.emit(buf.getvalue())
+            self.stage_finished.emit(1)
+
+            # ── ETAPA 3 — LECTOR DE BOLETAS ──────────────────────────────────────
+            self.stage_started.emit(2, "Lector de Boletas")
+
+            # datos_extractor["id"] es lo que LectorBoletas usa para buscar en
+            # el Excel ("ID de incidente"). Si el usuario especificó uno propio,
+            # se respeta esa indicación.
+            datos_para_lector = dict(datos_caso)
+            if self.id_incidente:
+                datos_para_lector["id"] = self.id_incidente
+
+            buf = io.StringIO()
+            try:
+                with contextlib.redirect_stdout(buf):
+                    reporte = analizar(
+                        datos_para_lector, clasificacion,
+                        excel_path=self.excel_path,
+                    )
+            except Exception as e:
+                self.log_emitted.emit(buf.getvalue())
+                raise RuntimeError(f"[LectorBoletas] {e}") from e
+            self.log_emitted.emit(buf.getvalue())
+            self.stage_finished.emit(2)
+
+            self.finished_ok.emit({
+                "caso":          datos_caso,
+                "clasificacion": clasificacion,
+                "lector":        reporte,
+            })
+
+        except RuntimeError as e:
+            etapa = str(e).split("]")[0].strip("[")
+            self.finished_error.emit(etapa, str(e))
+        except Exception as e:
+            self.finished_error.emit("Desconocida", f"{e}\n{traceback.format_exc()}")
+
+
+# ── WIDGET: TARJETA DE ETAPA (PIPELINE STEPS) ────────────────────────────────────
+
+class StageCard(QFrame):
+    """Tarjeta visual que representa una etapa del pipeline con su estado."""
+
+    PENDIENTE  = 0
+    EN_CURSO   = 1
+    COMPLETADA = 2
+    ERROR      = 3
+
+    def __init__(self, numero: int, titulo: str, subtitulo: str, parent=None):
+        super().__init__(parent)
+        self.numero = numero
+        self.estado = self.PENDIENTE
+
+        self.setFrameShape(QFrame.NoFrame)
+        self.setMinimumHeight(72)
+        self.setObjectName("stageCard")
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(14, 10, 14, 10)
+        layout.setSpacing(12)
+
+        self.badge = QLabel(str(numero))
+        self.badge.setFixedSize(34, 34)
+        self.badge.setAlignment(Qt.AlignCenter)
+        self.badge.setObjectName("stageBadge")
+
+        text_box = QVBoxLayout()
+        text_box.setSpacing(2)
+        self.lbl_titulo = QLabel(titulo)
+        self.lbl_titulo.setObjectName("stageTitulo")
+        self.lbl_subtitulo = QLabel(subtitulo)
+        self.lbl_subtitulo.setObjectName("stageSubtitulo")
+        text_box.addWidget(self.lbl_titulo)
+        text_box.addWidget(self.lbl_subtitulo)
+
+        self.lbl_estado = QLabel("Pendiente")
+        self.lbl_estado.setObjectName("stageEstado")
+        self.lbl_estado.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+
+        layout.addWidget(self.badge)
+        layout.addLayout(text_box, 1)
+        layout.addWidget(self.lbl_estado)
+
+        self._aplicar_estado()
+
+    def set_estado(self, estado: int):
+        self.estado = estado
+        self._aplicar_estado()
+
+    def _aplicar_estado(self):
+        if self.estado == self.PENDIENTE:
+            color_badge, color_text, texto = COLOR_BORDER, COLOR_TEXT_DIM, "Pendiente"
+        elif self.estado == self.EN_CURSO:
+            color_badge, color_text, texto = COLOR_ACCENT, COLOR_ACCENT, "En curso…"
+        elif self.estado == self.COMPLETADA:
+            color_badge, color_text, texto = COLOR_GREEN, COLOR_GREEN, "Completado ✓"
+        else:
+            color_badge, color_text, texto = COLOR_RED, COLOR_RED, "Error ✗"
+
+        self.badge.setStyleSheet(
+            f"background-color: {color_badge}; color: #0f1117; "
+            f"border-radius: 17px; font-weight: 700; font-size: 14px;"
+        )
+        self.lbl_estado.setStyleSheet(f"color: {color_text}; font-weight: 600; font-size: 12px;")
+        self.lbl_estado.setText(texto)
+
+
+# ── WIDGET: BADGE DE ESTADO FINAL ────────────────────────────────────────────────
+
+class EstadoBadge(QLabel):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAlignment(Qt.AlignCenter)
+        self.setMinimumHeight(46)
+        self.set_estado(None)
+
+    def set_estado(self, estado):
+        if estado is None:
+            self.setText("— SIN EJECUTAR —")
+            color = COLOR_GREY
+        else:
+            self.setText(estado.replace("_", " "))
+            color = ESTADO_COLOR.get(estado, COLOR_GREY)
+        self.setStyleSheet(
+            f"background-color: {color}22; color: {color}; "
+            f"border: 1.5px solid {color}; border-radius: 8px; "
+            f"font-weight: 700; font-size: 15px; letter-spacing: 0.5px;"
         )
 
-    cliente_id = df.loc[mask, "cliente"].iloc[0]
-    df_cliente = (
-        df[df["cliente"] == cliente_id]
-        .copy()
-        .sort_values("fechaemision", ascending=False)
-        .head(MAX_BOLETAS)
-    )
-
-    df_reclamada = df_cliente[
-        df_cliente["es boleta reclamada"].apply(lambda x: _bool(pd.Series([x]), 0) if not isinstance(x, bool) else x) == True
-    ].copy()
-
-    # Fallback más simple y robusto
-    try:
-        df_reclamada = df_cliente[df_cliente["es boleta reclamada"] == True].copy()
-    except Exception:
-        df_reclamada = pd.DataFrame()
-
-    return df_cliente, df_reclamada
-
-
-# ── CONTROLES PREVIOS CP01-CP10 ───────────────────────────────────────────────────
-
-def _controles_previos(df_cliente: pd.DataFrame, df_reclamada: pd.DataFrame) -> dict:
-    """
-    Evalúa los 10 controles de calidad y exclusión.
-    Cada resultado incluye: ok (bool), detalle (descripción técnica),
-    valores_observados (dict con los datos reales leídos) y accion (qué ocurre si falla).
-    CP10 se inicializa aquí y se actualiza tras evaluar perfiles.
-    """
-    cp = {}
-    n_rec = len(df_reclamada)
-    r = df_reclamada.iloc[0] if n_rec > 0 else None
-
-    # ── CP01 — Documento reclamado inequívoco ────────────────────────────────────
-    cp["CP01"] = {
-        "ok": True,   # Restricción desactivada temporalmente
-        "nombre": "Documento reclamado inequívoco",
-        "valores_observados": {
-            "filas_marcadas_como_reclamada": n_rec,
-        },
-        "detalle": (
-            f"Se encontró exactamente 1 boleta marcada como reclamada."
-            if n_rec == 1
-            else f"Se encontraron {n_rec} filas marcadas como reclamada "
-                 f"(se requiere exactamente 1)."
-        ),
-        "accion_si_falla": "Sin acción — restricción desactivada temporalmente.",
-    }
-
-    # ── CP02 — Tipo documental válido ────────────────────────────────────────────
-    if n_rec > 0:
-        tipo_doc = str(_get(r, "tipodocumento_texto", "sin dato")).lower()
-        ok_cp02  = tipo_doc in ("boleta", "factura")
-    else:
-        tipo_doc = "sin dato"
-        ok_cp02  = False
-
-    cp["CP02"] = {
-        "ok": ok_cp02,
-        "nombre": "Tipo documental válido",
-        "valores_observados": {
-            "tipodocumento_texto": tipo_doc,
-            "tipos_aceptados": ["boleta", "factura"],
-        },
-        "detalle": (
-            f"Documento reclamado es '{tipo_doc}' — tipo válido para automatización."
-            if ok_cp02
-            else f"Documento reclamado es '{tipo_doc}' — solo se aceptan boleta o factura. "
-                 f"Notas de crédito/débito requieren preprocesamiento."
-        ),
-        "accion_si_falla": "BLOQUEADO_POR_CONTROL — notas de crédito/débito no son el período principal.",
-    }
-
-    # ── CP03 — Deduplicación por doc_key ────────────────────────────────────────
-    dup_count = int(df_cliente.duplicated(subset=["doc_key"]).sum())
-    docs_dup  = df_cliente[df_cliente.duplicated(subset=["doc_key"], keep=False)]["doc_key"].unique().tolist()
-
-    cp["CP03"] = {
-        "ok": True, #dup_count == 0,
-        "nombre": "Deduplicación por doc_key",
-        "valores_observados": {
-            "total_filas_historial": len(df_cliente),
-            "filas_duplicadas": dup_count,
-            "doc_keys_duplicados": docs_dup[:5],  # máximo 5 para no saturar
-        },
-        "detalle": (
-            f"Sin duplicados en el historial de {len(df_cliente)} boletas."
-            if dup_count == 0
-            else f"Se detectaron {dup_count} fila(s) duplicada(s) por doc_key "
-                 f"en el historial. Esto impide calcular secuencias y promedios correctamente."
-        ),
-        "accion_si_falla": "BLOQUEADO_POR_CONTROL — duplicados distorsionan indicadores.",
-    }
-
-    # ── CP04 — CNR ───────────────────────────────────────────────────────────────
-    if n_rec > 0:
-        abono_cnr = _bool(r, "abono_cnr")
-        monto_cnr = _num(r, "monto_cnr")
-        tiene_cnr = abono_cnr or monto_cnr > 0
-    else:
-        abono_cnr, monto_cnr, tiene_cnr = False, 0.0, False
-
-    cp["CP04"] = {
-        "ok": not tiene_cnr,
-        "nombre": "Ausencia de CNR",
-        "valores_observados": {
-            "abono_cnr":  abono_cnr,
-            "monto_cnr":  monto_cnr,
-        },
-        "detalle": (
-            "Sin registro CNR en la boleta reclamada — puede continuar flujo estándar."
-            if not tiene_cnr
-            else f"Registro CNR detectado (abono_cnr={abono_cnr}, monto_cnr=${monto_cnr:,.0f}). "
-                 f"Debe procesarse en flujo CNR antes de evaluar Facturación Excesiva."
-        ),
-        "accion_si_falla": "BLOQUEADO_POR_CONTROL — derivar a flujo CNR (CP04).",
-    }
-
-    # ── CP05 — Calidad OCR ───────────────────────────────────────────────────────
-    if n_rec > 0:
-        score_ocr = _num(r, "calidad_score")
-        ok_cp05   = score_ocr >= Q_MIN
-    else:
-        score_ocr, ok_cp05 = 0.0, False
-
-    cp["CP05"] = {
-        "ok": ok_cp05,
-        "nombre": "Calidad de reconocimiento óptico (OCR)",
-        "valores_observados": {
-            "calidad_score":         score_ocr,
-            "umbral_minimo_q_min":   Q_MIN,
-            "diferencia_vs_umbral":  round(score_ocr - Q_MIN, 4),
-        },
-        "detalle": (
-            f"calidad_score = {score_ocr:.3f} ≥ umbral {Q_MIN} — legibilidad suficiente."
-            if ok_cp05
-            else f"calidad_score = {score_ocr:.3f} < umbral {Q_MIN} — "
-                 f"calidad de extracción insuficiente para automatización."
-        ),
-        "accion_si_falla": "BLOQUEADO_POR_CONTROL — derivar a experto para revisión manual de boleta.",
-    }
-
-    # ── CP06 — Historial suficiente ──────────────────────────────────────────────
-    boletas_validas = df_cliente[
-        df_cliente["tipodocumento_texto"].str.lower().isin(["boleta", "factura"])
-    ]
-    n_validas = len(boletas_validas)
-
-    cp["CP06"] = {
-        "ok": n_validas >= 3,
-        "nombre": "Historial suficiente para comparación",
-        "valores_observados": {
-            "total_boletas_en_historial":  len(df_cliente),
-            "boletas_factura_validas":     n_validas,
-            "minimo_requerido":            3,
-        },
-        "detalle": (
-            f"Historial suficiente: {n_validas} boleta(s)/factura(s) válidas disponibles."
-            if n_validas >= 3
-            else f"Historial insuficiente: solo {n_validas} boleta(s)/factura(s) válidas "
-                 f"(mínimo 3). No se pueden calcular comparativos históricos."
-        ),
-        "accion_si_falla": "DERIVAR — marcar regla como NO_EVALUABLE por falta de historial.",
-    }
-
-    # ── CP07 — Variables críticas sin nulos ──────────────────────────────────────
-    vars_criticas = [
-        "consumo_total", "dias_facturacion", "tipodocumento_texto",
-        "fechaemision", "montototal_doc",
-    ]
-    if n_rec > 0:
-        nulos   = [v for v in vars_criticas if _get(r, v) is None]
-        valores = {v: _get(r, v) for v in vars_criticas}
-    else:
-        nulos   = vars_criticas
-        valores = {v: None for v in vars_criticas}
-
-    cp["CP07"] = {
-        "ok": len(nulos) == 0,
-        "nombre": "Variables críticas sin nulos",
-        "valores_observados": {
-            "variables_revisadas": vars_criticas,
-            "variables_nulas":     nulos,
-            "valores_leidos":      {k: str(v) for k, v in valores.items()},
-        },
-        "detalle": (
-            "Todas las variables críticas tienen valor — no hay nulos bloqueantes."
-            if len(nulos) == 0
-            else f"Variables críticas con valor nulo: {nulos}. "
-                 f"Sin estos datos no se puede evaluar el caso."
-        ),
-        "accion_si_falla": "DERIVAR — marcar NO_EVALUABLE por variable(s) crítica(s) ausente(s).",
-    }
-
-    # ── CP08 — Medidores ─────────────────────────────────────────────────────────
-    if n_rec > 0:
-        n_med      = _num(r, "num_medidores_distintos")
-        cambio_med = _bool(r, "flag_cambio_medidor")
-        nromed     = _get(r, "nromed", "sin dato")
-    else:
-        n_med, cambio_med, nromed = 0.0, False, "sin dato"
-
-    ok_cp08 = not (n_med > 1 or cambio_med)
-
-    cp["CP08"] = {
-        "ok": ok_cp08,
-        "nombre": "Unicidad y estabilidad de medidor",
-        "valores_observados": {
-            "nromed":                  str(nromed),
-            "num_medidores_distintos": int(n_med),
-            "flag_cambio_medidor":     cambio_med,
-        },
-        "detalle": (
-            f"Medidor estable (nromed={nromed}, sin cambios detectados en el historial)."
-            if ok_cp08
-            else f"Problema de medidor detectado: {int(n_med)} medidor(es) distinto(s) "
-                 f"en el historial, cambio_medidor={cambio_med}. "
-                 f"Esto afecta la comparabilidad histórica."
-        ),
-        "accion_si_falla": "DERIVAR — cambio de medidor invalida comparaciones históricas.",
-    }
-
-    # ── CP09 — Ciclo de facturación dentro de rango operacional ─────────────────
-    if n_rec > 0:
-        dias_fac = _num(r, "dias_facturacion")
-        ok_cp09  = 15.0 <= dias_fac <= 95.0
-    else:
-        dias_fac, ok_cp09 = 0.0, False
-
-    cp["CP09"] = {
-        "ok": ok_cp09,
-        "nombre": "Ciclo de facturación dentro de rango operacional",
-        "valores_observados": {
-            "dias_facturacion":    dias_fac,
-            "rango_operacional":   "15 a 95 días",
-            "fuera_de_rango":      not ok_cp09,
-        },
-        "detalle": (
-            f"Ciclo de {dias_fac:.0f} días dentro del rango operacional (15-95 días)."
-            if ok_cp09
-            else f"Ciclo de {dias_fac:.0f} días fuera del rango operacional (15-95 días). "
-                 f"Puede indicar error en la extracción de datos o período atípico."
-        ),
-        "accion_si_falla": "DERIVAR — ciclo extremo requiere revisión de extracción.",
-    }
-
-    # ── CP10 — Conflicto inter-tipología (se actualiza tras evaluar perfiles) ────
-    cp["CP10"] = {
-        "ok": True,
-        "nombre": "Sin conflicto inter-tipología",
-        "valores_observados": {},
-        "detalle": "Pendiente — se evalúa tras identificar perfiles activos.",
-        "accion_si_falla": "DERIVAR — conflicto entre tipologías requiere resolución experta.",
-    }
-
-    return cp
-
-
-# ── EVALUACIÓN DE PERFILES C1-C14 ────────────────────────────────────────────────
-
-def _evaluar_perfiles(df_cliente: pd.DataFrame, df_reclamada: pd.DataFrame,
-                      tipologia: str) -> dict:
-    """
-    Evalúa los 14 perfiles sobre la boleta reclamada.
-    Retorna dict {codigo: {activo, rol, condiciones, detalle}}.
-    """
-    if len(df_reclamada) == 0:
-        return {}
-
-    r = df_reclamada.iloc[0]
-
-    def b(col):  return _bool(r, col)
-    def n(col):  return _num(r, col)
-    def g(col):  return _get(r, col, "N/D")
-
-    perfiles = {}
-
-    # ── T1 — FACTURACIÓN PROVISORIA ─────────────────────────────────────────────
-
-    # C1: 3+ períodos sin lectura Y el último también es estimado
-    c1_tres_sin    = b("flag_tres_o_mas_sin_lectura")
-    c1_ultimo_sin  = b("flag_ultimo_sin_lectura")
-    c1_activo      = c1_tres_sin and c1_ultimo_sin
-    perfiles["C1"] = {
-        "activo": c1_activo,
-        "rol": PERFIL_ROL["C1"],
-        "condiciones": {
-            "flag_tres_o_mas_sin_lectura": c1_tres_sin,
-            "flag_ultimo_sin_lectura":     c1_ultimo_sin,
-            "consecutivo_sin_lectura":     int(n("consecutivo_sin_lectura")),
-        },
-        "detalle": (
-            f"ACTIVO — {int(n('consecutivo_sin_lectura'))} período(s) consecutivos sin lectura real, "
-            f"incluido el período reclamado."
-            if c1_activo
-            else f"Inactivo — tres_o_mas_sin_lectura={c1_tres_sin}, "
-                 f"ultimo_sin_lectura={c1_ultimo_sin}."
-        ),
-    }
-
-    # C2: C1 activo + abono devolución provisoria con monto > 0
-    c2_abono  = b("abono_devolucion_provisorio")
-    c2_monto  = n("monto_devolucion_provisorio")
-    c2_activo = c1_activo and c2_abono and c2_monto > 0
-    perfiles["C2"] = {
-        "activo": c2_activo,
-        "rol": PERFIL_ROL["C2"],
-        "condiciones": {
-            "C1_activo":                   c1_activo,
-            "abono_devolucion_provisorio":  c2_abono,
-            "monto_devolucion_provisorio":  c2_monto,
-        },
-        "detalle": (
-            f"ACTIVO — Abono por devolución provisoria de ${c2_monto:,.0f} observado."
-            if c2_activo
-            else f"Inactivo — C1={c1_activo}, abono={c2_abono}, monto=${c2_monto:,.0f}."
-        ),
-    }
-
-    # C3: Sin C1; 2 sin lectura + último estimado + desviación >15% vs promedio 3m
-    c3_dos_sin   = b("flag_dos_sin_lectura")
-    c3_ult_sin   = b("flag_ultimo_sin_lectura")
-    c3_desv      = abs(n("variacion_vs_promedio_3m"))
-    c3_activo    = not c1_activo and c3_dos_sin and c3_ult_sin and c3_desv > 0.15
-    perfiles["C3"] = {
-        "activo": c3_activo,
-        "rol": PERFIL_ROL["C3"],
-        "condiciones": {
-            "C1_activo":                  c1_activo,
-            "flag_dos_sin_lectura":       c3_dos_sin,
-            "flag_ultimo_sin_lectura":    c3_ult_sin,
-            "variacion_vs_promedio_3m":   _pct(c3_desv),
-            "umbral_desviacion":          "15%",
-        },
-        "detalle": (
-            f"ACTIVO — Señal temprana: 2 períodos sin lectura y desviación del {_pct(c3_desv)} "
-            f"respecto al promedio de 3 meses."
-            if c3_activo
-            else f"Inactivo — C1={c1_activo}, dos_sin_lectura={c3_dos_sin}, "
-                 f"desv_3m={_pct(c3_desv)} (umbral >15%)."
-        ),
-    }
-
-    # C4: Sin lectura + ciclo irregular (modificador, no perfil primario)
-    c4_sin_lec  = b("flag_sin_lectura")
-    c4_irr      = b("flag_periodo_irregular")
-    c4_activo   = c4_sin_lec and c4_irr
-    perfiles["C4"] = {
-        "activo": c4_activo,
-        "rol": PERFIL_ROL["C4"],
-        "condiciones": {
-            "flag_sin_lectura":      c4_sin_lec,
-            "flag_periodo_irregular": c4_irr,
-        },
-        "detalle": (
-            "ACTIVO — Período sin lectura real con ciclo de facturación irregular."
-            if c4_activo
-            else f"Inactivo — sin_lectura={c4_sin_lec}, periodo_irregular={c4_irr}."
-        ),
-    }
-
-    # C5: Cliente especial + estimado (contexto, no determinante)
-    c5_esp     = b("flag_cliente_especial")
-    c5_est     = b("flag_sin_lectura")
-    c5_activo  = c5_esp and c5_est
-    perfiles["C5"] = {
-        "activo": c5_activo,
-        "rol": PERFIL_ROL["C5"],
-        "condiciones": {
-            "flag_cliente_especial": c5_esp,
-            "flag_sin_lectura":      c5_est,
-        },
-        "detalle": (
-            "ACTIVO — Cliente marcado como especial con período estimado."
-            if c5_activo
-            else f"Inactivo — cliente_especial={c5_esp}, estimado={c5_est}."
-        ),
-    }
-
-    # ── T2 — FACTURACIÓN EXCESIVA ────────────────────────────────────────────────
-
-    lectura_real = not b("flag_sin_lectura")
-
-    # C6: Aumento interanual ≥100% con lectura real
-    c6_ia100   = b("flag_aumento_interanual_100")
-    c6_var_ia  = n("variacion_interanual")
-    c6_activo  = c6_ia100 and lectura_real
-    perfiles["C6"] = {
-        "activo": c6_activo,
-        "rol": PERFIL_ROL["C6"],
-        "condiciones": {
-            "flag_aumento_interanual_100": c6_ia100,
-            "variacion_interanual":        _pct(c6_var_ia),
-            "lectura_real":                lectura_real,
-        },
-        "detalle": (
-            f"ACTIVO — Consumo {_pct(c6_var_ia)} superior al año anterior con lectura real."
-            if c6_activo
-            else f"Inactivo — aumento_interanual_100={c6_ia100} "
-                 f"(variación={_pct(c6_var_ia)}), lectura_real={lectura_real}."
-        ),
-    }
-
-    # C7: Consumo excede potencia contratada (alerta técnica, no elegible)
-    c7_exc    = b("flag_consumo_excede_potencia")
-    c7_pot    = n("potenciaconectada")
-    c7_cons   = n("consumo_total")
-    c7_activo = c7_exc and lectura_real
-    perfiles["C7"] = {
-        "activo": c7_activo,
-        "rol": PERFIL_ROL["C7"],
-        "condiciones": {
-            "flag_consumo_excede_potencia": c7_exc,
-            "potenciaconectada_kw":         c7_pot,
-            "consumo_total_kwh":            c7_cons,
-            "lectura_real":                 lectura_real,
-        },
-        "detalle": (
-            f"ACTIVO — Consumo de {c7_cons:,.0f} kWh supera la referencia de potencia "
-            f"contratada ({c7_pot:.1f} kW). Alta prioridad de revisión experta."
-            if c7_activo
-            else f"Inactivo — consumo_excede_potencia={c7_exc}, lectura_real={lectura_real}."
-        ),
-    }
-
-    # C8: Outlier estadístico + aumento mensual ≥100% con lectura real
-    c8_out    = b("flag_consumo_outlier")
-    c8_mens   = b("flag_aumento_consumo_100")
-    c8_activo = c8_out and c8_mens and lectura_real
-    perfiles["C8"] = {
-        "activo": c8_activo,
-        "rol": PERFIL_ROL["C8"],
-        "condiciones": {
-            "flag_consumo_outlier":      c8_out,
-            "flag_aumento_consumo_100":  c8_mens,
-            "lectura_real":              lectura_real,
-            "variacion_mes_anterior":    _pct(n("variacion_mes_anterior")),
-        },
-        "detalle": (
-            f"ACTIVO — Consumo estadísticamente atípico (outlier) con aumento ≥100% "
-            f"respecto al mes anterior ({_pct(n('variacion_mes_anterior'))})."
-            if c8_activo
-            else f"Inactivo — outlier={c8_out}, aumento_mensual_100={c8_mens}, "
-                 f"lectura_real={lectura_real}."
-        ),
-    }
-
-    # C9: Aumento interanual ≥30% + cercano a potencia (excluye C6 y C7)
-    c9_ia30   = b("flag_aumento_interanual_30")
-    c9_pot    = b("flag_consumo_cercano_potencia")
-    c9_activo = c9_ia30 and c9_pot and lectura_real and not c6_activo and not c7_activo
-    perfiles["C9"] = {
-        "activo": c9_activo,
-        "rol": PERFIL_ROL["C9"],
-        "condiciones": {
-            "flag_aumento_interanual_30":     c9_ia30,
-            "flag_consumo_cercano_potencia":  c9_pot,
-            "lectura_real":                   lectura_real,
-            "C6_activo":                      c6_activo,
-            "C7_activo":                      c7_activo,
-        },
-        "detalle": (
-            f"ACTIVO — Aumento interanual ≥30% con consumo cercano a la potencia "
-            f"contratada. Requiere verificación de potencia (supuesto S2-S3)."
-            if c9_activo
-            else f"Inactivo — ia30={c9_ia30}, cercano_potencia={c9_pot}, "
-                 f"C6={c6_activo}, C7={c7_activo}."
-        ),
-    }
-
-    # C10: Cambio de medidor + aumento mensual ≥30% (revisión experta)
-    c10_med   = b("flag_cambio_medidor")
-    c10_aum   = b("flag_aumento_consumo_30")
-    c10_activo = c10_med and c10_aum and lectura_real
-    perfiles["C10"] = {
-        "activo": c10_activo,
-        "rol": PERFIL_ROL["C10"],
-        "condiciones": {
-            "flag_cambio_medidor":      c10_med,
-            "flag_aumento_consumo_30":  c10_aum,
-            "lectura_real":             lectura_real,
-        },
-        "detalle": (
-            "ACTIVO — Cambio de medidor coincide con aumento de consumo ≥30%. "
-            "El cambio de medidor es hipótesis, no causa acreditada."
-            if c10_activo
-            else f"Inactivo — cambio_medidor={c10_med}, aumento_30={c10_aum}."
-        ),
-    }
-
-    # ── T3 — COBROS INDEBIDOS — INTERESES ────────────────────────────────────────
-
-    # C11: Tiene intereses + tasa alta (siempre revisión experta)
-    c11_int    = b("tiene_interes")
-    c11_tasa_a = b("flag_tasa_interes_alta")
-    c11_tasa_v = n("tasa_interes_anual")
-    c11_monto  = n("monto_total_intereses")
-    c11_activo = c11_int and c11_tasa_a
-    perfiles["C11"] = {
-        "activo": c11_activo,
-        "rol": PERFIL_ROL["C11"],
-        "condiciones": {
-            "tiene_interes":          c11_int,
-            "flag_tasa_interes_alta": c11_tasa_a,
-            "tasa_interes_anual":     _pct(c11_tasa_v),
-            "monto_total_intereses":  c11_monto,
-        },
-        "detalle": (
-            f"ACTIVO — Intereses cobrados: ${c11_monto:,.0f} a tasa anual {_pct(c11_tasa_v)}. "
-            f"Requiere revisión de base y antecedentes de la tasa."
-            if c11_activo
-            else f"Inactivo — tiene_interes={c11_int}, tasa_alta={c11_tasa_a} "
-                 f"(tasa={_pct(c11_tasa_v)})."
-        ),
-    }
-
-    # C12: C11 activo + saldo anterior pendiente
-    c12_saldo  = b("tiene_saldo_anterior")
-    c12_monto  = n("monto_saldo_anterior")
-    c12_activo = c11_activo and c12_saldo
-    perfiles["C12"] = {
-        "activo": c12_activo,
-        "rol": PERFIL_ROL["C12"],
-        "condiciones": {
-            "C11_activo":            c11_activo,
-            "tiene_saldo_anterior":  c12_saldo,
-            "monto_saldo_anterior":  c12_monto,
-        },
-        "detalle": (
-            f"ACTIVO — Saldo anterior de ${c12_monto:,.0f} pendiente. "
-            f"Requiere trazabilidad contable del origen del saldo."
-            if c12_activo
-            else f"Inactivo — C11={c11_activo}, saldo_anterior={c12_saldo} "
-                 f"(monto=${c12_monto:,.0f})."
-        ),
-    }
-
-    # ── T4 — ERROR DE LECTURA ────────────────────────────────────────────────────
-
-    # C13: Período irregular + lectura real + variación ≤30% vs promedio + consumo >0
-    c13_irr    = b("flag_periodo_irregular")
-    c13_var    = abs(n("variacion_vs_promedio_3m"))
-    c13_cons   = n("consumo_total")
-    c13_dias   = n("dias_facturacion")
-    c13_diario = n("consumo_diario_facturado")
-    c13_activo = c13_irr and lectura_real and c13_var <= 0.30 and c13_cons > 0
-    perfiles["C13"] = {
-        "activo": c13_activo,
-        "rol": PERFIL_ROL["C13"],
-        "condiciones": {
-            "flag_periodo_irregular":     c13_irr,
-            "lectura_real":               lectura_real,
-            "variacion_vs_promedio_3m":   _pct(c13_var),
-            "umbral_variacion":           "≤30%",
-            "consumo_total_kwh":          c13_cons,
-            "dias_facturacion":           int(c13_dias),
-            "consumo_diario_kwh":         round(c13_diario, 3),
-        },
-        "detalle": (
-            f"ACTIVO — Ciclo irregular de {int(c13_dias)} días con lectura real. "
-            f"Consumo diario {c13_diario:.2f} kWh/día, variación {_pct(c13_var)} "
-            f"respecto al promedio (≤30%: coherente con cambio de duración del ciclo)."
-            if c13_activo
-            else f"Inactivo — periodo_irregular={c13_irr}, lectura_real={lectura_real}, "
-                 f"var_3m={_pct(c13_var)} (umbral ≤30%), consumo={c13_cons:.0f} kWh."
-        ),
-    }
-
-    # C14: Consumo cero o negativo (siempre derivación)
-    c14_cero = b("flag_consumo_cero")
-    c14_neg  = b("flag_consumo_negativo")
-    c14_activo = c14_cero or c14_neg
-    perfiles["C14"] = {
-        "activo": c14_activo,
-        "rol": PERFIL_ROL["C14"],
-        "condiciones": {
-            "flag_consumo_cero":     c14_cero,
-            "flag_consumo_negativo": c14_neg,
-            "consumo_total_kwh":     n("consumo_total"),
-        },
-        "detalle": (
-            f"ACTIVO — Consumo anómalo: cero={c14_cero}, negativo={c14_neg} "
-            f"({n('consumo_total'):.3f} kWh). Requiere antecedente externo antes de despacho."
-            if c14_activo
-            else f"Inactivo — consumo_cero={c14_cero}, consumo_negativo={c14_neg}."
-        ),
-    }
-
-    return perfiles
-
-
-# ── PRIORIDAD INTRA-TIPOLOGÍA ────────────────────────────────────────────────────
-
-def _seleccionar_perfil(perfiles: dict, tipologia: str):
-    """
-    Aplica reglas de prioridad (Sección 9) sobre los perfiles activos
-    de la tipología propuesta.
-    Retorna (perfil_principal, modificadores, alertas).
-    """
-    activos = {
-        k for k, v in perfiles.items()
-        if v["activo"] and PERFIL_TIPOLOGIA.get(k) == tipologia
-    }
-
-    perfil_principal = None
-    modificadores    = []
-    alertas          = []
-
-    if tipologia == "T1":
-        if "C1" in activos:
-            perfil_principal = "C1"
-            for mod in ("C2", "C4", "C5"):
-                if mod in activos:
-                    modificadores.append(mod)
-        elif "C3" in activos:
-            alertas.append("C3")
-
-    elif tipologia == "T2":
-        # Prioridad: C7 > C6 > C8 > C9 > C10
-        for p in ["C7", "C6", "C8", "C9", "C10"]:
-            if p in activos:
-                if p in ("C7", "C9", "C10"):
-                    alertas.append(p)
-                else:
-                    perfil_principal = p
-                    break
-
-    elif tipologia == "T3":
-        if "C11" in activos:
-            perfil_principal = "C11"
-            if "C12" in activos:
-                modificadores.append("C12")
-
-    elif tipologia == "T4":
-        if "C14" in activos:
-            alertas.append("C14")   # C14 prima sobre C13 para derivación
-        elif "C13" in activos:
-            perfil_principal = "C13"
-
-    return perfil_principal, modificadores, alertas
-
-
-# ── CONFLICTOS INTER-TIPOLOGÍA (CP10) ────────────────────────────────────────────
-
-def _evaluar_conflictos(perfiles: dict, tipologia: str):
-    """Detecta perfiles activos de tipologías distintas a la propuesta."""
-    otras = {
-        k for k, v in perfiles.items()
-        if v["activo"] and PERFIL_TIPOLOGIA.get(k) != tipologia
-    }
-    if otras:
-        detalle_otras = ", ".join(
-            f"{k} ({TIPOLOGIA_NOMBRE.get(PERFIL_TIPOLOGIA[k], '?')})"
-            for k in sorted(otras)
+
+# ── VENTANA PRINCIPAL ─────────────────────────────────────────────────────────────
+
+class MainWindow(QMainWindow):
+
+    def __init__(self):
+        super().__init__()
+        self.worker = None
+        self.setWindowTitle("SEC · Pipeline de Clasificación y Prerresolución de Reclamos")
+        self.resize(1180, 780)
+        self.setMinimumSize(980, 680)
+
+        self._build_ui()
+        self._apply_stylesheet()
+
+    # ── CONSTRUCCIÓN DE LA INTERFAZ ──────────────────────────────────────────────
+
+    def _build_ui(self):
+        central = QWidget()
+        self.setCentralWidget(central)
+        root = QVBoxLayout(central)
+        root.setContentsMargins(20, 18, 20, 18)
+        root.setSpacing(14)
+
+        # ── Encabezado ────────────────────────────────────────────────────────────
+        header = QVBoxLayout()
+        header.setSpacing(2)
+        titulo = QLabel("Sistema de Clasificación y Prerresolución de Reclamos Eléctricos")
+        titulo.setObjectName("appTitulo")
+        subtitulo = QLabel("SEC · Extractor → Clasificador IA → Lector de Boletas  ·  v1.0")
+        subtitulo.setObjectName("appSubtitulo")
+        header.addWidget(titulo)
+        header.addWidget(subtitulo)
+        root.addLayout(header)
+
+        # ── Panel de entrada ──────────────────────────────────────────────────────
+        input_group = QGroupBox("Parámetros de ejecución")
+        input_layout = QGridLayout(input_group)
+        input_layout.setHorizontalSpacing(16)
+        input_layout.setVerticalSpacing(10)
+        input_layout.setContentsMargins(16, 16, 16, 16)
+
+        lbl_ref = QLabel("N° de referencia SEC:")
+        self.input_referencia = QLineEdit()
+        self.input_referencia.setPlaceholderText("Ej: 260128-000718")
+        self.input_referencia.setText(str(ID_REFERENCIA_DEFAULT))
+
+        lbl_id = QLabel("ID de incidente (Excel boletas):")
+        self.input_id_incidente = QLineEdit()
+        self.input_id_incidente.setPlaceholderText("Ej: 2835115")
+        self.input_id_incidente.setText(ID_INCIDENTE_DEFAULT)
+
+        self.btn_ejecutar = QPushButton("▶  EJECUTAR PIPELINE")
+        self.btn_ejecutar.setObjectName("btnEjecutar")
+        self.btn_ejecutar.setMinimumHeight(40)
+        self.btn_ejecutar.clicked.connect(self._on_ejecutar)
+
+        self.btn_limpiar = QPushButton("Limpiar consola")
+        self.btn_limpiar.setObjectName("btnSecundario")
+        self.btn_limpiar.setMinimumHeight(40)
+        self.btn_limpiar.clicked.connect(self._limpiar_consola)
+
+        input_layout.addWidget(lbl_ref,                  0, 0)
+        input_layout.addWidget(self.input_referencia,    0, 1)
+        input_layout.addWidget(lbl_id,                    0, 2)
+        input_layout.addWidget(self.input_id_incidente,  0, 3)
+        input_layout.addWidget(self.btn_ejecutar,         0, 4)
+        input_layout.addWidget(self.btn_limpiar,          0, 5)
+        input_layout.setColumnStretch(1, 2)
+        input_layout.setColumnStretch(3, 2)
+
+        root.addWidget(input_group)
+
+        # ── Cuerpo: etapas (izquierda) + consola (derecha) ──────────────────────
+        body = QHBoxLayout()
+        body.setSpacing(14)
+
+        # ── Columna izquierda: progreso por etapas + resultado ──────────────────
+        left_col = QVBoxLayout()
+        left_col.setSpacing(12)
+
+        stages_group = QGroupBox("Progreso del pipeline")
+        stages_layout = QVBoxLayout(stages_group)
+        stages_layout.setSpacing(8)
+        stages_layout.setContentsMargins(14, 14, 14, 14)
+
+        self.stage_cards = [
+            StageCard(1, "Extractor SEC",     "Descarga y localiza el caso en el reporte de pendientes"),
+            StageCard(2, "Clasificador IA",   "Clasifica el texto del reclamo vía API"),
+            StageCard(3, "Lector de Boletas", "Evalúa perfiles C1-C14 y controles previos"),
+        ]
+        for card in self.stage_cards:
+            stages_layout.addWidget(card)
+
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 3)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setTextVisible(True)
+        self.progress_bar.setFormat("Etapa %v / %m")
+        stages_layout.addWidget(self.progress_bar)
+
+        left_col.addWidget(stages_group)
+
+        result_group = QGroupBox("Resultado final")
+        result_layout = QVBoxLayout(result_group)
+        result_layout.setSpacing(8)
+        result_layout.setContentsMargins(14, 14, 14, 14)
+
+        self.estado_badge = EstadoBadge()
+        result_layout.addWidget(self.estado_badge)
+
+        self.lbl_resumen = QLabel("Ejecute el pipeline para ver el resultado aquí.")
+        self.lbl_resumen.setObjectName("resumenTexto")
+        self.lbl_resumen.setWordWrap(True)
+        self.lbl_resumen.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setWidget(self.lbl_resumen)
+        result_layout.addWidget(scroll, 1)
+
+        left_col.addWidget(result_group, 1)
+
+        body.addLayout(left_col, 4)
+
+        # ── Columna derecha: consola de logs ─────────────────────────────────────
+        console_group = QGroupBox("Consola de ejecución")
+        console_layout = QVBoxLayout(console_group)
+        console_layout.setContentsMargins(10, 10, 10, 10)
+
+        self.console = QPlainTextEdit()
+        self.console.setReadOnly(True)
+        self.console.setObjectName("console")
+        self.console.setLineWrapMode(QPlainTextEdit.WidgetWidth)
+        font = QFont("Consolas")
+        font.setStyleHint(QFont.Monospace)
+        font.setPointSize(10)
+        self.console.setFont(font)
+        console_layout.addWidget(self.console)
+
+        body.addWidget(console_group, 6)
+
+        root.addLayout(body, 1)
+
+        # ── Barra de estado ───────────────────────────────────────────────────────
+        self.statusBar().showMessage("Listo. Ingrese los parámetros y presione Ejecutar.")
+
+        self._log_sistema("Sistema iniciado. Esperando ejecución.")
+
+    # ── ESTILOS ───────────────────────────────────────────────────────────────────
+
+    def _apply_stylesheet(self):
+        self.setStyleSheet(f"""
+            QMainWindow, QWidget {{
+                background-color: {COLOR_BG};
+                color: {COLOR_TEXT};
+                font-family: Segoe UI, Arial, sans-serif;
+            }}
+            #appTitulo {{
+                font-size: 19px;
+                font-weight: 700;
+                color: {COLOR_TEXT};
+            }}
+            #appSubtitulo {{
+                font-size: 11.5px;
+                color: {COLOR_TEXT_DIM};
+                letter-spacing: 0.3px;
+            }}
+            QGroupBox {{
+                background-color: {COLOR_PANEL};
+                border: 1px solid {COLOR_BORDER};
+                border-radius: 10px;
+                margin-top: 10px;
+                font-weight: 600;
+                font-size: 12px;
+                color: {COLOR_TEXT_DIM};
+                padding-top: 6px;
+            }}
+            QGroupBox::title {{
+                subcontrol-origin: margin;
+                left: 14px;
+                padding: 0 6px;
+                color: {COLOR_TEXT_DIM};
+            }}
+            QLineEdit {{
+                background-color: {COLOR_PANEL_ALT};
+                border: 1px solid {COLOR_BORDER};
+                border-radius: 6px;
+                padding: 8px 10px;
+                color: {COLOR_TEXT};
+                font-size: 13px;
+            }}
+            QLineEdit:focus {{
+                border: 1px solid {COLOR_ACCENT};
+            }}
+            QLabel {{
+                color: {COLOR_TEXT};
+                font-size: 12.5px;
+            }}
+            #resumenTexto {{
+                color: {COLOR_TEXT};
+                font-size: 12.5px;
+                line-height: 150%;
+            }}
+            QPushButton#btnEjecutar {{
+                background-color: {COLOR_ACCENT};
+                color: white;
+                border: none;
+                border-radius: 6px;
+                font-weight: 700;
+                font-size: 13px;
+                padding: 0 18px;
+            }}
+            QPushButton#btnEjecutar:hover {{
+                background-color: #2563eb;
+            }}
+            QPushButton#btnEjecutar:disabled {{
+                background-color: {COLOR_GREY};
+                color: #d1d5db;
+            }}
+            QPushButton#btnSecundario {{
+                background-color: {COLOR_PANEL_ALT};
+                color: {COLOR_TEXT_DIM};
+                border: 1px solid {COLOR_BORDER};
+                border-radius: 6px;
+                font-size: 12px;
+                padding: 0 14px;
+            }}
+            QPushButton#btnSecundario:hover {{
+                background-color: {COLOR_BORDER};
+                color: {COLOR_TEXT};
+            }}
+            QFrame#stageCard {{
+                background-color: {COLOR_PANEL_ALT};
+                border: 1px solid {COLOR_BORDER};
+                border-radius: 8px;
+            }}
+            #stageTitulo {{
+                font-weight: 700;
+                font-size: 13px;
+                color: {COLOR_TEXT};
+            }}
+            #stageSubtitulo {{
+                font-size: 10.5px;
+                color: {COLOR_TEXT_DIM};
+            }}
+            QProgressBar {{
+                background-color: {COLOR_PANEL_ALT};
+                border: 1px solid {COLOR_BORDER};
+                border-radius: 6px;
+                text-align: center;
+                color: {COLOR_TEXT};
+                font-size: 11px;
+                height: 22px;
+            }}
+            QProgressBar::chunk {{
+                background-color: {COLOR_ACCENT};
+                border-radius: 5px;
+            }}
+            QPlainTextEdit#console {{
+                background-color: #0a0c10;
+                color: #b8f5c0;
+                border: 1px solid {COLOR_BORDER};
+                border-radius: 8px;
+                padding: 10px;
+                selection-background-color: {COLOR_ACCENT_DIM};
+            }}
+            QScrollArea {{
+                background-color: transparent;
+                border: none;
+            }}
+            QStatusBar {{
+                background-color: {COLOR_PANEL};
+                color: {COLOR_TEXT_DIM};
+                font-size: 11px;
+            }}
+            QScrollBar:vertical {{
+                background-color: {COLOR_PANEL_ALT};
+                width: 10px;
+                border-radius: 5px;
+            }}
+            QScrollBar::handle:vertical {{
+                background-color: {COLOR_BORDER};
+                border-radius: 5px;
+                min-height: 24px;
+            }}
+            QScrollBar::handle:vertical:hover {{
+                background-color: {COLOR_GREY};
+            }}
+        """)
+
+    # ── LOGGING EN CONSOLA ────────────────────────────────────────────────────────
+
+    def _log_sistema(self, mensaje: str, nivel: str = "INFO"):
+        """Línea de log generada por la propia GUI (no por los módulos del pipeline)."""
+        ts = datetime.now().strftime("%H:%M:%S")
+        color = {
+            "INFO":  "#7dd3fc",
+            "OK":    "#86efac",
+            "WARN":  "#fde047",
+            "ERROR": "#fca5a5",
+        }.get(nivel, "#7dd3fc")
+        self.console.appendHtml(
+            f'<span style="color:#5b6472">{ts}</span>&nbsp;&nbsp;'
+            f'<span style="color:{color}; font-weight:700">{nivel:<5}</span>&nbsp;'
+            f'<span style="color:#e6e9ef">{self._escape(mensaje)}</span>'
         )
-        return True, (
-            f"Señales activas de tipología(s) distintas a {tipologia} "
-            f"({TIPOLOGIA_NOMBRE.get(tipologia, '')}): {detalle_otras}."
-        )
-    return False, "Sin conflictos — todos los perfiles activos corresponden a la tipología propuesta."
+        self._scroll_console_to_bottom()
 
+    def _log_pipeline(self, texto: str):
+        """
+        Línea de log proveniente de print() dentro de Extractor/Clasificador/
+        LectorBoletas. Se compacta y se aplica jerarquía visual:
+          - Separadores largos se reducen a una marca corta.
+          - Perfiles C1-C14 inactivos se muestran en una sola línea sin su
+            detalle (ya implícito: no se activaron). Los activos sí muestran
+            su detalle completo, porque son los relevantes para la decisión.
+          - El resto del contenido se conserva íntegro.
+        """
+        if texto is None:
+            return
 
-# ── ÍNDICE DE SEVERIDAD ──────────────────────────────────────────────────────────
+        lineas = texto.splitlines()
+        salida_html = []
+        omitir_siguiente_detalle = False
 
-def _calcular_severidad(df_reclamada: pd.DataFrame) -> tuple:
-    """
-    Calcula el índice de severidad y retorna (score, detalle_familias).
-    Regla: dentro de cada familia solo suma la condición de mayor peso.
-    """
-    if len(df_reclamada) == 0:
-        return 0, {}
+        for linea_raw in lineas:
+            linea = linea_raw.rstrip()
+            stripped = linea.strip()
 
-    r = df_reclamada.iloc[0]
+            # Si la línea anterior fue un perfil inactivo, su línea de detalle
+            # ("Inactivo — ...") se omite para no duplicar ruido.
+            if omitir_siguiente_detalle:
+                omitir_siguiente_detalle = False
+                if stripped.startswith("Inactivo"):
+                    continue
 
-    def b(col): return _bool(r, col)
-    def n(col): return _num(r, col)
+            if stripped.startswith("○") or "[inactivo]" in stripped:
+                omitir_siguiente_detalle = True
 
-    score   = 0
-    familias = {}
+            html = self._formatear_linea_pipeline(linea)
+            if html is not None:
+                salida_html.append(html)
 
-    # Lectura ausente
-    consec = n("consecutivo_sin_lectura")
-    if consec >= 5:
-        pts = 4; desc = f"{int(consec)} períodos consecutivos sin lectura (≥5)"
-    elif b("flag_tres_o_mas_sin_lectura"):
-        pts = 3; desc = "3 o más períodos sin lectura"
-    elif b("flag_dos_sin_lectura"):
-        pts = 1; desc = "2 períodos sin lectura"
-    else:
-        pts = 0; desc = "sin señal"
-    score += pts
-    familias["Lectura ausente"] = {"puntos": pts, "descripcion": desc}
+        if salida_html:
+            self.console.appendHtml("<br>".join(salida_html))
+        self._scroll_console_to_bottom()
 
-    # Aumento interanual
-    var_ia = n("variacion_interanual")
-    if var_ia >= 2.00:
-        pts = 4; desc = f"variación interanual ≥200% ({_pct(var_ia)})"
-    elif b("flag_aumento_interanual_100"):
-        pts = 3; desc = f"aumento interanual ≥100% ({_pct(var_ia)})"
-    elif b("flag_aumento_interanual_30"):
-        pts = 1; desc = f"aumento interanual ≥30% ({_pct(var_ia)})"
-    else:
-        pts = 0; desc = "sin señal"
-    score += pts
-    familias["Aumento interanual"] = {"puntos": pts, "descripcion": desc}
+    def _formatear_linea_pipeline(self, linea: str):
+        """
+        Aplica color/peso según el tipo de línea. Devuelve None para líneas
+        que deben omitirse (compactación), o el HTML de la línea a mostrar.
+        """
+        stripped = linea.strip()
 
-    # Potencia de referencia
-    if b("flag_consumo_excede_potencia"):
-        pts = 4; desc = "consumo excede potencia contratada — fuerza revisión experta"
-    elif b("flag_consumo_cercano_potencia"):
-        pts = 1; desc = "consumo cercano a potencia contratada"
-    else:
-        pts = 0; desc = "sin señal"
-    score += pts
-    familias["Potencia de referencia"] = {"puntos": pts, "descripcion": desc}
+        if stripped == "":
+            return "&nbsp;"
 
-    # Intereses
-    if b("flag_tasa_interes_extrema"):
-        pts = 4; desc = f"tasa de interés extrema ({_pct(n('tasa_interes_anual'))} anual)"
-    elif b("flag_tasa_interes_alta"):
-        pts = 2; desc = f"tasa de interés alta ({_pct(n('tasa_interes_anual'))} anual)"
-    else:
-        pts = 0; desc = "sin señal"
-    score += pts
-    familias["Intereses"] = {"puntos": pts, "descripcion": desc}
+        n_indent = len(linea) - len(linea.lstrip(" "))
+        indent_html = "&nbsp;" * min(n_indent, 6)   # tope de sangría visual
+        esc = self._escape(stripped)
 
-    # Outlier estadístico
-    if b("flag_consumo_outlier"):
-        pts = 2; desc = f"consumo estadísticamente atípico ({n('consumo_total'):,.0f} kWh)"
-    else:
-        pts = 0; desc = "sin señal"
-    score += pts
-    familias["Outlier estadístico"] = {"puntos": pts, "descripcion": desc}
+        # Separadores gruesos (═, ━, ==) → reducidos a una marca corta
+        if all(c in "═━=" for c in stripped):
+            return '<span style="color:#2a2f3d">────────────────────</span>'
 
-    # Aumento mensual
-    if b("flag_aumento_consumo_100"):
-        pts = 2; desc = f"aumento mensual ≥100% ({_pct(n('variacion_mes_anterior'))})"
-    else:
-        pts = 0; desc = "sin señal"
-    score += pts
-    familias["Aumento mensual"] = {"puntos": pts, "descripcion": desc}
+        # Separadores finos (─, -, ·) → se omiten (ya hay espaciado de bloque)
+        if all(c in "─\u00b7-" for c in stripped):
+            return None
 
-    # Ciclo irregular
-    if b("flag_periodo_irregular"):
-        pts = 1; desc = f"ciclo irregular ({n('dias_facturacion'):.0f} días)"
-    else:
-        pts = 0; desc = "sin señal"
-    score += pts
-    familias["Ciclo irregular"] = {"puntos": pts, "descripcion": desc}
+        # Encabezados de sección  [ TEXTO ]  o  === TEXTO ===
+        if (stripped.startswith("[") and stripped.endswith("]")) or \
+           (stripped.startswith("===") and stripped.endswith("===")):
+            titulo = stripped.strip("[]= ").strip()
+            return (f'<span style="color:#60a5fa; font-weight:700; '
+                    f'font-size:11px; letter-spacing:0.6px">▸ {self._escape(titulo)}</span>')
 
-    # Cambio de medidor
-    if b("flag_cambio_medidor"):
-        pts = 1; desc = "cambio de medidor en el historial"
-    else:
-        pts = 0; desc = "sin señal"
-    score += pts
-    familias["Cambio de medidor"] = {"puntos": pts, "descripcion": desc}
+        # Controles / perfiles aprobados
+        if stripped.startswith(("✓", "●")) or "[ACTIVO]" in stripped or stripped.startswith("[OK]"):
+            return f'{indent_html}<span style="color:#86efac; font-weight:600">{esc}</span>'
 
-    # Consumo cero o negativo
-    if b("flag_consumo_negativo"):
-        pts = 2; desc = f"consumo negativo ({n('consumo_total'):.3f} kWh)"
-    elif b("flag_consumo_cero"):
-        pts = 1; desc = "consumo cero"
-    else:
-        pts = 0; desc = "sin señal"
-    score += pts
-    familias["Consumo anómalo"] = {"puntos": pts, "descripcion": desc}
+        # Perfiles inactivos → línea compacta y tenue (sin su detalle, ver _log_pipeline)
+        if stripped.startswith("○") or "[inactivo]" in stripped:
+            return f'{indent_html}<span style="color:#4b5563; font-size:11px">{esc}</span>'
 
-    return score, familias
+        # Controles / perfiles fallidos, bloqueos o advertencias
+        if stripped.startswith(("✗", "⚠")) or stripped.startswith("[FALLA]") or stripped.startswith("ERROR"):
+            return f'{indent_html}<span style="color:#fca5a5; font-weight:600">{esc}</span>'
 
+        # Bullets de detalle anidado
+        if stripped.startswith("•") or n_indent >= 4:
+            return f'{indent_html}<span style="color:#9aa3b5">{esc}</span>'
 
-def _banda_severidad(score: int) -> str:
-    if score == 0:   return "Sin señal"
-    if score <= 3:   return "Baja"
-    if score <= 6:   return "Media"
-    if score <= 9:   return "Alta"
-    return "Crítica"
+        # Líneas clave: valor (ej. "ID: 123" o "Empresa : CGE")
+        if ":" in stripped and len(stripped.split(":", 1)[0].strip()) <= 28:
+            etiqueta, _, resto = stripped.partition(":")
+            return (f'{indent_html}<span style="color:#7dd3fc">{self._escape(etiqueta)}:</span>'
+                    f'<span style="color:#d4d8e2">{self._escape(resto)}</span>')
 
+        # Línea genérica
+        return f'{indent_html}<span style="color:#b8f5c0">{esc}</span>'
 
-# ── TEXTO DE PRERRESOLUCIÓN ───────────────────────────────────────────────────────
+    def _scroll_console_to_bottom(self):
+        self.console.moveCursor(QTextCursor.End)
+        self.console.ensureCursorVisible()
 
-def _construir_texto(perfil: str, df_reclamada: pd.DataFrame, modificadores: list) -> str:
-    """Plantillas cerradas (Sección 12.1). Solo hechos observables y cálculos reproducibles."""
-    if len(df_reclamada) == 0 or perfil is None:
-        return ""
-
-    r = df_reclamada.iloc[0]
-    def n(col): return _num(r, col)
-
-    periodo  = str(_get(r, "periodo", "sin dato"))
-    consumo  = n("consumo_total")
-    dias     = int(n("dias_facturacion"))
-    var_ia   = n("variacion_interanual")
-    var_prom = n("variacion_vs_promedio_3m")
-    consec   = int(n("consecutivo_sin_lectura"))
-    c_diario = n("consumo_diario_facturado")
-
-    if perfil == "C1":
-        texto = (
-            f"Del análisis de las boletas asociadas al suministro se observan "
-            f"{consec} período(s) consecutivo(s) facturado(s) sin lectura real, "
-            f"incluido el período {periodo}. "
-            f"La información disponible permite clasificar el reclamo como "
-            f"Facturación Provisoria para efectos de su tratamiento."
-        )
-        if "C2" in modificadores:
-            monto_dev = n("monto_devolucion_provisorio")
-            if monto_dev > 0:
-                texto += (
-                    f" Se observa además un abono por devolución provisoria "
-                    f"de ${monto_dev:,.0f}."
-                )
-        texto += (
-            " La suficiencia de eventuales ajustes no se presume "
-            "a partir de esta clasificación."
+    @staticmethod
+    def _escape(texto: str) -> str:
+        return (
+            texto.replace("&", "&amp;")
+                 .replace("<", "&lt;")
+                 .replace(">", "&gt;")
         )
 
-    elif perfil in ("C6", "C8"):
-        texto = (
-            f"La boleta del período {periodo} registra {consumo:,.0f} kWh. "
-            f"Este valor presenta una variación de {_pct(var_ia)} respecto del "
-            f"período comparable del año anterior y activa criterios internos de "
-            f"anomalía cuantitativa. La información disponible permite clasificar "
-            f"el reclamo como Facturación Excesiva para efectos de su tratamiento. "
-            f"La clasificación identifica una inconsistencia que debe abordarse "
-            f"conforme al procedimiento aplicable; no atribuye por sí sola una "
-            f"causa técnica específica."
+    def _limpiar_consola(self):
+        self.console.clear()
+        self._log_sistema("Consola limpiada.")
+
+    # ── EJECUCIÓN DEL PIPELINE ────────────────────────────────────────────────────
+
+    def _on_ejecutar(self):
+        n_referencia = self.input_referencia.text().strip()
+        id_incidente = self.input_id_incidente.text().strip()
+
+        if not n_referencia:
+            QMessageBox.warning(self, "Falta información",
+                                 "Debe ingresar el N° de referencia SEC.")
+            return
+
+        # Reset visual
+        for card in self.stage_cards:
+            card.set_estado(StageCard.PENDIENTE)
+        self.progress_bar.setValue(0)
+        self.estado_badge.set_estado(None)
+        self.lbl_resumen.setText("Ejecutando pipeline…")
+        self.btn_ejecutar.setEnabled(False)
+        self.btn_ejecutar.setText("⏳ EJECUTANDO…")
+        self.statusBar().showMessage("Ejecutando pipeline…")
+
+        self._log_sistema(f"Iniciando pipeline — N° referencia: {n_referencia} "
+                           f"| ID incidente (Excel): {id_incidente or '(usar el de SEC)'}")
+
+        self.worker = PipelineWorker(
+            n_referencia=n_referencia,
+            id_incidente=id_incidente,
+            id_pendientes=ID_PENDIENTES,
+            excel_path=EXCEL_PATH,
+        )
+        self.worker.log_emitted.connect(self._log_pipeline)
+        self.worker.stage_started.connect(self._on_stage_started)
+        self.worker.stage_finished.connect(self._on_stage_finished)
+        self.worker.finished_ok.connect(self._on_finished_ok)
+        self.worker.finished_error.connect(self._on_finished_error)
+        self.worker.start()
+
+    def _on_stage_started(self, indice: int, nombre: str):
+        self.stage_cards[indice].set_estado(StageCard.EN_CURSO)
+        self.statusBar().showMessage(f"Ejecutando etapa {indice + 1}/3 — {nombre}…")
+        self._log_sistema(f"Etapa {indice + 1}/3 iniciada: {nombre}", "INFO")
+
+    def _on_stage_finished(self, indice: int):
+        self.stage_cards[indice].set_estado(StageCard.COMPLETADA)
+        self.progress_bar.setValue(indice + 1)
+        self._log_sistema(f"Etapa {indice + 1}/3 completada.", "OK")
+
+    def _on_finished_ok(self, resultado: dict):
+        self.btn_ejecutar.setEnabled(True)
+        self.btn_ejecutar.setText("▶  EJECUTAR PIPELINE")
+        self.statusBar().showMessage("Pipeline completado correctamente.")
+        self._log_sistema("Pipeline completado correctamente.", "OK")
+
+        caso          = resultado["caso"]
+        clasificacion = resultado["clasificacion"]
+        reporte       = resultado["lector"]
+
+        estado = reporte.get("estado")
+        self.estado_badge.set_estado(estado)
+
+        tipo_cod    = reporte.get("tipologia", "N/A")
+        tipo_nombre = TIPOLOGIA_NOMBRE.get(tipo_cod, "")
+        confianza   = clasificacion.get("factor_de_confianza", 0)
+        perfil      = reporte.get("perfil_principal") or "—"
+        modif       = reporte.get("modificadores", [])
+        alertas     = reporte.get("alertas", [])
+        sev         = reporte.get("severidad", 0)
+        banda       = reporte.get("banda_severidad", "Sin señal")
+        causal      = reporte.get("causal_derivacion", "")
+        texto_pre   = reporte.get("texto_prerresolucion", "")
+
+        html = []
+        html.append(f"<b>ID de incidente:</b> {caso.get('id', 'N/A')}")
+        html.append(f"<b>N° referencia:</b> {caso.get('n_referencia', 'N/A')}")
+        html.append(f"<b>Fecha reclamo:</b> {caso.get('fecha', 'N/A')}")
+        html.append(f"<b>Empresa:</b> {caso.get('empresa', 'N/A')}")
+        html.append("<br>")
+        html.append(f"<b>Clasificación IA:</b> {clasificacion.get('clasificacion', 'N/A')}")
+        html.append(f"<b>Confianza:</b> {round(confianza * 100)}%")
+        html.append(f"<b>Tipología:</b> {tipo_cod} — {tipo_nombre}")
+        html.append("<br>")
+        html.append(f"<b>Perfil principal:</b> {perfil}")
+        html.append(f"<b>Modificadores:</b> {', '.join(modif) if modif else '—'}")
+        html.append(f"<b>Alertas:</b> {', '.join(alertas) if alertas else '—'}")
+        html.append(f"<b>Severidad:</b> {sev} pts ({banda})")
+
+        if causal:
+            html.append("<br><b>Causal de derivación:</b>")
+            for parte in causal.split("; "):
+                parte = parte.strip()
+                if parte:
+                    html.append(f"&nbsp;&nbsp;• {parte}")
+
+        if texto_pre:
+            html.append("<br><b>Prerresolución automática:</b>")
+            html.append(f"<i>{texto_pre}</i>")
+
+        self.lbl_resumen.setText("<br>".join(html))
+
+    def _on_finished_error(self, etapa: str, mensaje: str):
+        self.btn_ejecutar.setEnabled(True)
+        self.btn_ejecutar.setText("▶  EJECUTAR PIPELINE")
+        self.statusBar().showMessage(f"Error en etapa: {etapa}")
+
+        # Marcar como error la tarjeta de la etapa en curso
+        for card in self.stage_cards:
+            if card.estado == StageCard.EN_CURSO:
+                card.set_estado(StageCard.ERROR)
+
+        self._log_sistema(f"ERROR en {etapa}: {mensaje}", "ERROR")
+        self.estado_badge.setText("ERROR")
+        self.estado_badge.setStyleSheet(
+            f"background-color: {COLOR_RED}22; color: {COLOR_RED}; "
+            f"border: 1.5px solid {COLOR_RED}; border-radius: 8px; "
+            f"font-weight: 700; font-size: 15px;"
+        )
+        self.lbl_resumen.setText(
+            f"<b style='color:{COLOR_RED}'>Error durante la ejecución</b><br><br>"
+            f"<b>Etapa:</b> {etapa}<br>"
+            f"<b>Detalle:</b><br>{self._escape(mensaje).replace(chr(10), '<br>')}"
         )
 
-    elif perfil == "C13":
-        texto = (
-            f"El período reclamado comprende {dias} días, duración que se aparta "
-            f"del ciclo habitual. El consumo diario registrado es "
-            f"{c_diario:.2f} kWh/día y su variación respecto del promedio reciente "
-            f"es {_pct(var_prom)}. La información disponible permite clasificar el "
-            f"reclamo como Error de Lectura asociado a la duración del ciclo "
-            f"para efectos de su tratamiento."
-        )
-
-    else:
-        texto = (
-            f"El caso del período {periodo} requiere revisión experta. "
-            f"No se genera prerresolución automática."
-        )
-
-    return texto
+        QMessageBox.critical(self, f"Error en {etapa}", mensaje[:600])
 
 
-# ── RESUMEN EJECUTIVO ─────────────────────────────────────────────────────────────
+# ── PUNTO DE ENTRADA ──────────────────────────────────────────────────────────────
 
-def _resumen_ejecutivo(
-    estado: str, tipologia: str, confianza: float,
-    perfil_principal, modificadores: list, alertas: list,
-    sev: int, banda_sev: str, familias_sev: dict,
-    cp: dict, perfiles: dict,
-    causas_derivacion: list, texto_pre: str,
-    datos_extractor: dict, df_reclamada: pd.DataFrame,
-) -> str:
-    """
-    Genera un resumen ejecutivo legible en consola con todos los
-    controles, perfiles evaluados y decisión final.
-    """
-    SEP  = "=" * 65
-    sep2 = "-" * 65
-    lin  = []
-    add  = lin.append
+def main():
+    app = QApplication(sys.argv)
+    app.setStyle("Fusion")
+    window = MainWindow()
+    window.show()
+    sys.exit(app.exec_())
 
-    add(SEP)
-    add("  RESUMEN EJECUTIVO — LECTOR DE BOLETAS")
-    add(SEP)
-
-    # ── Identificación del caso ──────────────────────────────────────────────────
-    add("\n[ CASO ]")
-    add(f"  ID de incidente : {datos_extractor.get('id', 'N/D')}")
-    add(f"  N° referencia   : {datos_extractor.get('n_referencia', 'N/D')}")
-    add(f"  Fecha reclamo   : {datos_extractor.get('fecha', 'N/D')}")
-    add(f"  Empresa         : {datos_extractor.get('empresa', 'N/D')}")
-    add(f"  Categoría SEC   : {datos_extractor.get('cat3', 'N/D')}")
-
-    if len(df_reclamada) > 0:
-        r = df_reclamada.iloc[0]
-        add(f"  Boleta reclamada: {_get(r, 'doc_key', 'N/D')} "
-            f"| Período: {_get(r, 'periodo', 'N/D')} "
-            f"| Fecha emisión: {_get(r, 'fechaemision', 'N/D')}")
-        add(f"  Consumo total   : {_num(r, 'consumo_total'):,.0f} kWh "
-            f"| Días facturación: {int(_num(r, 'dias_facturacion'))}")
-        add(f"  Monto total     : ${_num(r, 'montototal_doc'):,.0f}")
-
-    # ── Clasificador textual ─────────────────────────────────────────────────────
-    add(f"\n[ CLASIFICADOR TEXTUAL ]")
-    add(f"  Tipología propuesta : {tipologia} — {TIPOLOGIA_NOMBRE.get(tipologia, '?')}")
-    add(f"  Confianza           : {_pct(confianza)}")
-
-    # ── Controles previos ────────────────────────────────────────────────────────
-    add(f"\n[ CONTROLES PREVIOS ]")
-    for cod, info in cp.items():
-        icono  = "✓" if info["ok"] else "✗"
-        estado_cp = "OK" if info["ok"] else "FALLA"
-        add(f"  {icono} {cod} — {info.get('nombre', '')} [{estado_cp}]")
-        add(f"       {info['detalle']}")
-        if not info["ok"]:
-            add(f"       ⚠ Acción: {info.get('accion_si_falla', 'Ver especificación.')}")
-
-    # ── Perfiles evaluados ────────────────────────────────────────────────────────
-    add(f"\n[ PERFILES C1-C14 EVALUADOS ]")
-    perfiles_activos = [k for k, v in perfiles.items() if v["activo"]]
-    for cod in ["C1","C2","C3","C4","C5","C6","C7","C8","C9","C10","C11","C12","C13","C14"]:
-        if cod not in perfiles:
-            continue
-        info  = perfiles[cod]
-        icono = "●" if info["activo"] else "○"
-        add(f"  {icono} {cod} {'[ACTIVO]' if info['activo'] else '[inactivo]'} — {info['rol']}")
-        add(f"       {info['detalle']}")
-
-    # ── Conflictos inter-tipología ────────────────────────────────────────────────
-    add(f"\n[ PERFILES ACTIVOS TOTALES ]")
-    if perfiles_activos:
-        for p in perfiles_activos:
-            rol_tp = TIPOLOGIA_NOMBRE.get(PERFIL_TIPOLOGIA.get(p, ""), "?")
-            add(f"  • {p} ({rol_tp})")
-    else:
-        add("  (ninguno)")
-
-    # ── Severidad ────────────────────────────────────────────────────────────────
-    add(f"\n[ ÍNDICE DE SEVERIDAD ]")
-    add(f"  Score total : {sev} puntos → Banda: {banda_sev}")
-    for familia, detalle in familias_sev.items():
-        if detalle["puntos"] > 0:
-            add(f"  + {detalle['puntos']:2d} pt — {familia}: {detalle['descripcion']}")
-
-    # ── Selección de perfil ───────────────────────────────────────────────────────
-    add(f"\n[ SELECCIÓN DE PERFIL ]")
-    add(f"  Perfil principal : {perfil_principal or '(ninguno)'}")
-    add(f"  Modificadores    : {modificadores or '(ninguno)'}")
-    add(f"  Alertas activas  : {alertas or '(ninguno)'}")
-
-    # ── Decisión final ────────────────────────────────────────────────────────────
-    add(f"\n[ DECISIÓN FINAL ]")
-    add(f"  Estado : {estado}")
-    if causas_derivacion:
-        add(f"  Causas de derivación / bloqueo:")
-        for causa in causas_derivacion:
-            add(f"    • {causa}")
-
-    if texto_pre:
-        add(f"\n[ PRERRESOLUCIÓN AUTOMÁTICA ]")
-        for linea in texto_pre.split(". "):
-            linea = linea.strip()
-            if linea:
-                add(f"  {linea}.")
-
-    add(f"\n{SEP}\n")
-    return "\n".join(lin)
-
-
-# ── FUNCIÓN PRINCIPAL ─────────────────────────────────────────────────────────────
-
-def analizar(
-    datos_extractor: dict,
-    clasificacion_textual: dict,
-    excel_path: str = EXCEL_PATH,
-) -> dict:
-    """
-    Ejecuta el lector de boletas completo.
-
-    Parameters
-    ----------
-    datos_extractor       : dict  — resultado de Extractor.extraer()
-    clasificacion_textual : dict  — resultado de Clasificador.clasificar()
-    excel_path            : str   — ruta al Excel de boletas
-
-    Returns
-    -------
-    dict con: estado, tipologia, perfil_principal, modificadores, alertas,
-              severidad, banda_severidad, familias_severidad, controles_previos,
-              perfiles, texto_prerresolucion, reporte_operacional,
-              resumen_ejecutivo, causal_derivacion
-    """
-    ID_REFERENCIA = str(datos_extractor.get("id", "")).strip()
-
-    # ── 1. Cargar boletas ────────────────────────────────────────────────────────
-    try:
-        df_cliente, df_reclamada = _cargar_boletas(excel_path, ID_REFERENCIA)
-    except ValueError as e:
-        msg = str(e)
-        print(f"[LectorBoletas] NO_EVALUABLE — {msg}")
-        return {
-            "estado": "NO_EVALUABLE", "tipologia": None,
-            "perfil_principal": None, "modificadores": [], "alertas": [],
-            "severidad": 0, "banda_severidad": "Sin señal", "familias_severidad": {},
-            "controles_previos": {}, "perfiles": {},
-            "texto_prerresolucion": "", "reporte_operacional": {},
-            "resumen_ejecutivo": f"NO_EVALUABLE — {msg}",
-            "causal_derivacion": msg,
-        }
-
-    # ── 2. Normalizar tipología ──────────────────────────────────────────────────
-    tipo_raw  = str(clasificacion_textual.get("clasificacion", "")).strip().lower()
-    confianza = _num(pd.Series({"v": clasificacion_textual.get("factor_de_confianza", 0)}), "v")
-    tipologia = TIPOLOGIA_MAP.get(tipo_raw, "T5")
-
-    if tipologia == "T5":
-        sev, familias = _calcular_severidad(df_reclamada)
-        causal = (
-            f"Clasificador textual emitió tipología no reconocida o T5 "
-            f"(entrada: '{tipo_raw}') — derivación automática sin evaluación de perfiles."
-        )
-        resumen = _resumen_ejecutivo(
-            "CLASIFICADO_PARA_REVISION", "T5", confianza,
-            None, [], [], sev, _banda_severidad(sev), familias,
-            {}, {}, [causal], "", datos_extractor, df_reclamada,
-        )
-        print(resumen)
-        return {
-            "estado": "CLASIFICADO_PARA_REVISION", "tipologia": "T5",
-            "perfil_principal": None, "modificadores": [], "alertas": [],
-            "severidad": sev, "banda_severidad": _banda_severidad(sev),
-            "familias_severidad": familias,
-            "controles_previos": {}, "perfiles": {},
-            "texto_prerresolucion": "", "reporte_operacional": {},
-            "resumen_ejecutivo": resumen, "causal_derivacion": causal,
-        }
-
-    # ── 3. Controles previos CP01-CP09 ───────────────────────────────────────────
-    cp = _controles_previos(df_cliente, df_reclamada)
-    causas_derivacion = []
-
-    # Bloqueantes: detienen el flujo inmediatamente
-    for cod in ("CP02", "CP03", "CP04", "CP05"):  # CP01 desactivado
-        if not cp[cod]["ok"]:
-            sev, familias = _calcular_severidad(df_reclamada)
-            causal = f"{cod} ({cp[cod]['nombre']}): {cp[cod]['detalle']}"
-            resumen = _resumen_ejecutivo(
-                "BLOQUEADO_POR_CONTROL", tipologia, confianza,
-                None, [], [], sev, _banda_severidad(sev), familias,
-                cp, {}, [causal], "", datos_extractor, df_reclamada,
-            )
-            print(resumen)
-            return {
-                "estado": "BLOQUEADO_POR_CONTROL", "tipologia": tipologia,
-                "perfil_principal": None, "modificadores": [], "alertas": [],
-                "severidad": sev, "banda_severidad": _banda_severidad(sev),
-                "familias_severidad": familias,
-                "controles_previos": cp, "perfiles": {},
-                "texto_prerresolucion": "", "reporte_operacional": {},
-                "resumen_ejecutivo": resumen, "causal_derivacion": causal,
-            }
-
-    # Derivantes: acumulan causas pero no detienen la evaluación de perfiles
-    for cod in ("CP06", "CP07", "CP08", "CP09"):
-        if not cp[cod]["ok"]:
-            causas_derivacion.append(
-                f"{cod} ({cp[cod]['nombre']}): {cp[cod]['detalle']}"
-            )
-
-    # ── 4. Evaluación de perfiles ────────────────────────────────────────────────
-    perfiles = _evaluar_perfiles(df_cliente, df_reclamada, tipologia)
-
-    # ── 5. Conflictos inter-tipología → CP10 ────────────────────────────────────
-    hay_conflicto, detalle_conflicto = _evaluar_conflictos(perfiles, tipologia)
-    perfiles_activos_otros = {
-        k for k, v in perfiles.items()
-        if v["activo"] and PERFIL_TIPOLOGIA.get(k) != tipologia
-    }
-    cp["CP10"] = {
-        "ok":      not hay_conflicto,
-        "nombre":  "Sin conflicto inter-tipología",
-        "valores_observados": {
-            "tipologia_propuesta":          tipologia,
-            "perfiles_activos_otras_tipol": sorted(perfiles_activos_otros),
-        },
-        "detalle":             detalle_conflicto,
-        "accion_si_falla":     "DERIVAR — conflicto entre tipologías requiere resolución experta.",
-    }
-    if hay_conflicto:
-        causas_derivacion.append(f"CP10: {detalle_conflicto}")
-
-    # ── 6. Selección de perfil ───────────────────────────────────────────────────
-    perfil_principal, modificadores, alertas = _seleccionar_perfil(perfiles, tipologia)
-
-    # ── 7. Verificar señal compatible ────────────────────────────────────────────
-    activos_tipologia = {
-        k for k, v in perfiles.items()
-        if v["activo"] and PERFIL_TIPOLOGIA.get(k) == tipologia
-    }
-    if not activos_tipologia:
-        sev, familias = _calcular_severidad(df_reclamada)
-        causal = (
-            f"SIN_SENAL_COMPATIBLE — ningún perfil de {tipologia} "
-            f"({TIPOLOGIA_NOMBRE.get(tipologia, '')}) se activó con los datos disponibles. "
-            f"Las boletas no muestran señales consistentes con la tipología propuesta."
-        )
-        resumen = _resumen_ejecutivo(
-            "SIN_SENAL_COMPATIBLE", tipologia, confianza,
-            None, [], [], sev, _banda_severidad(sev), familias,
-            cp, perfiles, [causal], "", datos_extractor, df_reclamada,
-        )
-        print(resumen)
-        return {
-            "estado": "SIN_SENAL_COMPATIBLE", "tipologia": tipologia,
-            "perfil_principal": None, "modificadores": [], "alertas": [],
-            "severidad": sev, "banda_severidad": _banda_severidad(sev),
-            "familias_severidad": familias,
-            "controles_previos": cp, "perfiles": perfiles,
-            "texto_prerresolucion": "", "reporte_operacional": {},
-            "resumen_ejecutivo": resumen, "causal_derivacion": causal,
-        }
-
-    # ── 8. Severidad ─────────────────────────────────────────────────────────────
-    sev, familias = _calcular_severidad(df_reclamada)
-    banda_sev = _banda_severidad(sev)
-
-    # ── 9. Estado final ──────────────────────────────────────────────────────────
-    if causas_derivacion:
-        estado = "CLASIFICADO_PARA_REVISION"
-    elif perfil_principal is None:
-        estado = "CLASIFICADO_PARA_REVISION"
-        causas_derivacion.append(
-            "No se identificó perfil primario elegible activo para la tipología propuesta."
-        )
-    elif perfil_principal not in PERFILES_ELEGIBLES:
-        estado = "CLASIFICADO_PARA_REVISION"
-        causas_derivacion.append(
-            f"Perfil {perfil_principal} ({PERFIL_ROL.get(perfil_principal, '')}) "
-            f"no está habilitado para despacho automático en la versión actual."
-        )
-    elif alertas:
-        estado = "CLASIFICADO_PARA_REVISION"
-        alertas_desc = ", ".join(
-            f"{a} ({PERFIL_ROL.get(a, '')})" for a in alertas
-        )
-        causas_derivacion.append(
-            f"Alertas activas impiden despacho automático: {alertas_desc}."
-        )
-    else:
-        estado = "VALIDADO_PARA_DESPACHO"
-
-    # ── 10. Texto de prerresolución ───────────────────────────────────────────────
-    texto_pre = ""
-    if estado == "VALIDADO_PARA_DESPACHO":
-        texto_pre = _construir_texto(perfil_principal, df_reclamada, modificadores)
-
-    # ── 11. Reporte operacional (para auditoría) ──────────────────────────────────
-    reporte_op: dict = {
-        "ID_REFERENCIA":              ID_REFERENCIA,
-        "empresa":              datos_extractor.get("empresa"),
-        "fecha_reclamo":        datos_extractor.get("fecha"),
-        "tipologia_propuesta":  tipologia,
-        "nombre_tipologia":     TIPOLOGIA_NOMBRE.get(tipologia),
-        "confianza_textual":    confianza,
-        "perfil_principal":     perfil_principal,
-        "modificadores":        modificadores,
-        "alertas":              alertas,
-        "severidad":            sev,
-        "banda_severidad":      banda_sev,
-        "controles_previos":    {k: {"ok": v["ok"], "detalle": v["detalle"]} for k, v in cp.items()},
-        "perfiles_activos":     [k for k, v in perfiles.items() if v["activo"]],
-        "causal_derivacion":    "; ".join(causas_derivacion) if causas_derivacion else "",
-    }
-    if len(df_reclamada) > 0:
-        r = df_reclamada.iloc[0]
-        reporte_op.update({
-            "doc_key":                  str(_get(r, "doc_key", "")),
-            "periodo":                  str(_get(r, "periodo", "")),
-            "consumo_total_kwh":        _num(r, "consumo_total"),
-            "dias_facturacion":         int(_num(r, "dias_facturacion")),
-            "montototal_doc":           _num(r, "montototal_doc"),
-            "variacion_interanual":     _num(r, "variacion_interanual"),
-            "variacion_vs_promedio_3m": _num(r, "variacion_vs_promedio_3m"),
-            "consecutivo_sin_lectura":  int(_num(r, "consecutivo_sin_lectura")),
-            "calidad_score":            _num(r, "calidad_score"),
-        })
-
-    # ── 12. Resumen ejecutivo ─────────────────────────────────────────────────────
-    resumen = _resumen_ejecutivo(
-        estado, tipologia, confianza,
-        perfil_principal, modificadores, alertas,
-        sev, banda_sev, familias,
-        cp, perfiles, causas_derivacion, texto_pre,
-        datos_extractor, df_reclamada,
-    )
-    print(resumen)
-
-    return {
-        "estado":               estado,
-        "tipologia":            tipologia,
-        "perfil_principal":     perfil_principal,
-        "modificadores":        modificadores,
-        "alertas":              alertas,
-        "severidad":            sev,
-        "banda_severidad":      banda_sev,
-        "familias_severidad":   familias,
-        "controles_previos":    cp,
-        "perfiles":             perfiles,
-        "texto_prerresolucion": texto_pre,
-        "reporte_operacional":  reporte_op,
-        "resumen_ejecutivo":    resumen,
-        "causal_derivacion":    "; ".join(causas_derivacion) if causas_derivacion else "",
-    }
-
-
-# ── EJECUCIÓN DIRECTA ─────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    import json
-    from Extractor import extraer, ID_REFERENCIA, ID_PENDIENTES
-    from Clasificador import clasificar
-
-    datos_caso    = extraer(ID_REFERENCIA=ID_REFERENCIA, id_pendientes=ID_PENDIENTES)
-    clasificacion = clasificar(datos_caso)
-    reporte       = analizar(datos_caso, clasificacion)
+    main()
