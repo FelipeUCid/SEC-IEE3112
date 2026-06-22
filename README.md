@@ -7,7 +7,7 @@ Extractor.py  →  Clasificador.py  →  LectorBoletas.py
    (SEC API)      (IA / AWS Lambda)     (Excel boletas)
 ```
 
-Incluye una interfaz gráfica de escritorio (`gui_app.py`, PyQt5) para ejecutar el flujo completo sin usar la consola.
+Incluye una interfaz gráfica de escritorio (`main.py`, PyQt5) para ejecutar el flujo completo sin usar la consola.
 
 ---
 
@@ -74,8 +74,7 @@ proyecto/
 ├── Extractor.py        # Descarga el caso desde la API de SEC
 ├── Clasificador.py     # Clasifica el texto del reclamo vía API de IA
 ├── LectorBoletas.py    # Motor determinístico de perfiles C1-C14
-├── main.py              # Orquestador de consola (los 3 pasos en secuencia)
-├── gui_app.py            # Interfaz gráfica de escritorio (PyQt5)
+├── main.py              # Flujo principal y GUI
 └── base_recl_LectorBLT_IA.xlsx   # Excel de boletas históricas (no incluido en el repo)
 ```
 
@@ -95,9 +94,6 @@ SEC_PASSWORD = "TU_CONTRASEÑA"     # Reemplazar
 ```python
 CLASIFICADOR_API_KEY = "TU_API_KEY"     # Reemplazar
 ```
-
-> ⚠️ **No subir credenciales reales a repositorios públicos.** Si una contraseña o API key quedó expuesta en algún historial (chat, commit, etc.), rótala de inmediato en el sistema correspondiente.
-
 ---
 
 ## Uso por consola
@@ -123,7 +119,7 @@ ID_PENDIENTES = 105111              # ID del reporte de pendientes en SEC
 ## Uso con interfaz gráfica
 
 ```bash
-python gui_app.py
+python main.py
 ```
 
 La ventana permite:
