@@ -11,17 +11,11 @@ from PyQt5.QtWidgets import (
     QLabel, QLineEdit, QPushButton, QProgressBar, QPlainTextEdit, QFrame,
     QGroupBox, QSizePolicy, QScrollArea, QMessageBox, QSpacerItem
 )
-
 from Extractor     import extraer,   ID_REFERENCIA as ID_REFERENCIA_DEFAULT, ID_PENDIENTES
 from Clasificador  import clasificar
 from LectorBoletas import analizar,  EXCEL_PATH, TIPOLOGIA_NOMBRE
 
-
-# ── ID DE INCIDENTE POR DEFECTO (HARDCODEADO) ────────────────────────────────────
-# El Excel de boletas se filtra por "ID de incidente". Se deja un valor por
-# defecto para agilizar pruebas; el usuario puede sobreescribirlo en la GUI.
 ID_INCIDENTE_DEFAULT = "2835115"
-
 
 # ── PALETA Y ESTILOS ──────────────────────────────────────────────────────────────
 
@@ -53,13 +47,6 @@ MONO_FONT = "Consolas, 'Cascadia Mono', 'Courier New', monospace"
 # ── HILO DE TRABAJO ───────────────────────────────────────────────────────────────
 
 class PipelineWorker(QThread):
-    """
-    Ejecuta Extractor → Clasificador → LectorBoletas en un hilo separado
-    para no bloquear la interfaz. Cada etapa captura su propio stdout en un
-    buffer local (io.StringIO) — NUNCA se modifica sys.stdout global, para
-    evitar condiciones de carrera con el hilo principal de Qt — y emite el
-    bloque completo de log al finalizar esa etapa (éxito o error).
-    """
     log_emitted      = pyqtSignal(str)
     stage_started    = pyqtSignal(int, str)     # (índice de etapa, nombre)
     stage_finished   = pyqtSignal(int)          # índice de etapa completada
@@ -90,9 +77,6 @@ class PipelineWorker(QThread):
             self.log_emitted.emit(buf.getvalue())
             self.stage_finished.emit(0)
 
-            # Forzar que el ID de incidente usado por el lector sea el indicado
-            # por el usuario en la GUI (puede diferir del que retorna SEC si se
-            # desea apuntar manualmente a otra fila del Excel).
             if self.id_incidente:
                 datos_caso = dict(datos_caso)
                 datos_caso["_id_incidente_excel"] = self.id_incidente
@@ -112,9 +96,6 @@ class PipelineWorker(QThread):
             # ── ETAPA 3 — LECTOR DE BOLETAS ──────────────────────────────────────
             self.stage_started.emit(2, "Lector de Boletas")
 
-            # datos_extractor["id"] es lo que LectorBoletas usa para buscar en
-            # el Excel ("ID de incidente"). Si el usuario especificó uno propio,
-            # se respeta esa indicación.
             datos_para_lector = dict(datos_caso)
             if self.id_incidente:
                 datos_para_lector["id"] = self.id_incidente
@@ -144,12 +125,7 @@ class PipelineWorker(QThread):
         except Exception as e:
             self.finished_error.emit("Desconocida", f"{e}\n{traceback.format_exc()}")
 
-
-# ── WIDGET: TARJETA DE ETAPA (PIPELINE STEPS) ────────────────────────────────────
-
 class StageCard(QFrame):
-    """Tarjeta visual que representa una etapa del pipeline con su estado."""
-
     PENDIENTE  = 0
     EN_CURSO   = 1
     COMPLETADA = 2
@@ -213,9 +189,6 @@ class StageCard(QFrame):
         self.lbl_estado.setStyleSheet(f"color: {color_text}; font-weight: 600; font-size: 12px;")
         self.lbl_estado.setText(texto)
 
-
-# ── WIDGET: BADGE DE ESTADO FINAL ────────────────────────────────────────────────
-
 class EstadoBadge(QLabel):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -240,7 +213,6 @@ class EstadoBadge(QLabel):
 # ── VENTANA PRINCIPAL ─────────────────────────────────────────────────────────────
 
 class MainWindow(QMainWindow):
-
     def __init__(self):
         super().__init__()
         self.worker = None
@@ -251,8 +223,6 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self._apply_stylesheet()
 
-    # ── CONSTRUCCIÓN DE LA INTERFAZ ──────────────────────────────────────────────
-
     def _build_ui(self):
         central = QWidget()
         self.setCentralWidget(central)
@@ -260,7 +230,7 @@ class MainWindow(QMainWindow):
         root.setContentsMargins(20, 18, 20, 18)
         root.setSpacing(14)
 
-        # ── Encabezado ────────────────────────────────────────────────────────────
+        # Encabezado
         header = QVBoxLayout()
         header.setSpacing(2)
         titulo = QLabel("Sistema de Clasificación y Prerresolución de Reclamos Eléctricos")
@@ -271,7 +241,7 @@ class MainWindow(QMainWindow):
         header.addWidget(subtitulo)
         root.addLayout(header)
 
-        # ── Panel de entrada ──────────────────────────────────────────────────────
+        # Panel de entrada
         input_group = QGroupBox("Parámetros de ejecución")
         input_layout = QGridLayout(input_group)
         input_layout.setHorizontalSpacing(16)
@@ -298,22 +268,20 @@ class MainWindow(QMainWindow):
         self.btn_limpiar.setMinimumHeight(40)
         self.btn_limpiar.clicked.connect(self._limpiar_consola)
 
-        input_layout.addWidget(lbl_ref,                  0, 0)
-        input_layout.addWidget(self.input_referencia,    0, 1)
-        input_layout.addWidget(lbl_id,                    0, 2)
-        input_layout.addWidget(self.input_id_incidente,  0, 3)
-        input_layout.addWidget(self.btn_ejecutar,         0, 4)
-        input_layout.addWidget(self.btn_limpiar,          0, 5)
+        input_layout.addWidget(lbl_ref, 0, 0)
+        input_layout.addWidget(self.input_referencia, 0, 1)
+        input_layout.addWidget(lbl_id, 0, 2)
+        input_layout.addWidget(self.input_id_incidente, 0, 3)
+        input_layout.addWidget(self.btn_ejecutar, 0, 4)
+        input_layout.addWidget(self.btn_limpiar,  0, 5)
         input_layout.setColumnStretch(1, 2)
         input_layout.setColumnStretch(3, 2)
 
         root.addWidget(input_group)
 
-        # ── Cuerpo: etapas (izquierda) + consola (derecha) ──────────────────────
         body = QHBoxLayout()
         body.setSpacing(14)
 
-        # ── Columna izquierda: progreso por etapas + resultado ──────────────────
         left_col = QVBoxLayout()
         left_col.setSpacing(12)
 
@@ -323,8 +291,8 @@ class MainWindow(QMainWindow):
         stages_layout.setContentsMargins(14, 14, 14, 14)
 
         self.stage_cards = [
-            StageCard(1, "Extractor SEC",     "Descarga y localiza el caso en el reporte de pendientes"),
-            StageCard(2, "Clasificador IA",   "Clasifica el texto del reclamo vía API"),
+            StageCard(1, "Extractor SEC", "Descarga y localiza el caso en el reporte de pendientes"),
+            StageCard(2, "Clasificador IA", "Clasifica el texto del reclamo vía API"),
             StageCard(3, "Lector de Boletas", "Evalúa perfiles C1-C14 y controles previos"),
         ]
         for card in self.stage_cards:
@@ -362,7 +330,6 @@ class MainWindow(QMainWindow):
 
         body.addLayout(left_col, 4)
 
-        # ── Columna derecha: consola de logs ─────────────────────────────────────
         console_group = QGroupBox("Consola de ejecución")
         console_layout = QVBoxLayout(console_group)
         console_layout.setContentsMargins(10, 10, 10, 10)
@@ -381,12 +348,10 @@ class MainWindow(QMainWindow):
 
         root.addLayout(body, 1)
 
-        # ── Barra de estado ───────────────────────────────────────────────────────
         self.statusBar().showMessage("Listo. Ingrese los parámetros y presione Ejecutar.")
-
         self._log_sistema("Sistema iniciado. Esperando ejecución.")
 
-    # ── ESTILOS ───────────────────────────────────────────────────────────────────
+    # ESTILOS
 
     def _apply_stylesheet(self):
         self.setStyleSheet(f"""
@@ -528,10 +493,7 @@ class MainWindow(QMainWindow):
             }}
         """)
 
-    # ── LOGGING EN CONSOLA ────────────────────────────────────────────────────────
-
     def _log_sistema(self, mensaje: str, nivel: str = "INFO"):
-        """Línea de log generada por la propia GUI (no por los módulos del pipeline)."""
         ts = datetime.now().strftime("%H:%M:%S")
         color = {
             "INFO":  "#7dd3fc",
@@ -547,15 +509,6 @@ class MainWindow(QMainWindow):
         self._scroll_console_to_bottom()
 
     def _log_pipeline(self, texto: str):
-        """
-        Línea de log proveniente de print() dentro de Extractor/Clasificador/
-        LectorBoletas. Se compacta y se aplica jerarquía visual:
-          - Separadores largos se reducen a una marca corta.
-          - Perfiles C1-C14 inactivos se muestran en una sola línea sin su
-            detalle (ya implícito: no se activaron). Los activos sí muestran
-            su detalle completo, porque son los relevantes para la decisión.
-          - El resto del contenido se conserva íntegro.
-        """
         if texto is None:
             return
 
@@ -567,8 +520,6 @@ class MainWindow(QMainWindow):
             linea = linea_raw.rstrip()
             stripped = linea.strip()
 
-            # Si la línea anterior fue un perfil inactivo, su línea de detalle
-            # ("Inactivo — ...") se omite para no duplicar ruido.
             if omitir_siguiente_detalle:
                 omitir_siguiente_detalle = False
                 if stripped.startswith("Inactivo"):
@@ -586,10 +537,6 @@ class MainWindow(QMainWindow):
         self._scroll_console_to_bottom()
 
     def _formatear_linea_pipeline(self, linea: str):
-        """
-        Aplica color/peso según el tipo de línea. Devuelve None para líneas
-        que deben omitirse (compactación), o el HTML de la línea a mostrar.
-        """
         stripped = linea.strip()
 
         if stripped == "":
@@ -654,8 +601,6 @@ class MainWindow(QMainWindow):
     def _limpiar_consola(self):
         self.console.clear()
         self._log_sistema("Consola limpiada.")
-
-    # ── EJECUCIÓN DEL PIPELINE ────────────────────────────────────────────────────
 
     def _on_ejecutar(self):
         n_referencia = self.input_referencia.text().strip()
@@ -778,9 +723,6 @@ class MainWindow(QMainWindow):
         )
 
         QMessageBox.critical(self, f"Error en {etapa}", mensaje[:600])
-
-
-# ── PUNTO DE ENTRADA ──────────────────────────────────────────────────────────────
 
 def main():
     app = QApplication(sys.argv)

@@ -1,28 +1,12 @@
-"""
-LectorBoletas.py  ·  v3.0
---------------------------
-Recibe el dict de Extractor.extraer() y el dict de Clasificador.clasificar(),
-carga el Excel de boletas históricas, evalúa los controles previos CP01-CP10
-y los perfiles C1-C14 definidos en la especificación funcional v2.2, y emite
-un reporte estructurado con estado de despacho y resumen ejecutivo detallado.
-
-Estados de salida (Anexo B):
-    VALIDADO_PARA_DESPACHO
-    CLASIFICADO_PARA_REVISION
-    NO_EVALUABLE
-    BLOQUEADO_POR_CONTROL
-    SIN_SENAL_COMPATIBLE
-"""
-
 import warnings
 import pandas as pd
 
 warnings.filterwarnings("ignore", category=UserWarning)
 
-# ── CONFIGURACIÓN ────────────────────────────────────────────────────────────────
+#  ─────────────────────────── CONFIGURACIÓN ────────────────────────────────────────────────────────────────
 EXCEL_PATH  = "base_recl_LectorBLT_IA.xlsx"
-Q_MIN       = 1.0     # Umbral mínimo calidad_score  (pendiente calibración)
-MAX_BOLETAS = 24      # Máximo de boletas históricas a considerar
+Q_MIN       = 1.0 # Umbral mínimo calidad_score
+MAX_BOLETAS = 24  # Máximo de boletas históricas a considerar
 
 TIPOLOGIA_MAP = {
     "facturación provisoria":       "T1",
@@ -72,10 +56,9 @@ PERFIL_ROL = {
 }
 
 
-# ── HELPERS DE LECTURA SEGURA ────────────────────────────────────────────────────
+# ───────────────────────────  HELPERS DE LECTURA ──────────────────────────────────────────────────────────────── 
 
 def _get(row: pd.Series, col: str, default=None):
-    """Acceso seguro a una celda de pandas Series; retorna default si no existe o es NaN."""
     try:
         val = row[col]
         if pd.isna(val):
@@ -86,7 +69,6 @@ def _get(row: pd.Series, col: str, default=None):
 
 
 def _bool(row: pd.Series, col: str) -> bool:
-    """Lee una celda booleana de forma segura desde una pandas Series."""
     val = _get(row, col, False)
     if isinstance(val, bool):
         return val
@@ -98,7 +80,6 @@ def _bool(row: pd.Series, col: str) -> bool:
 
 
 def _num(row: pd.Series, col: str, default: float = 0.0) -> float:
-    """Lee una celda numérica de forma segura desde una pandas Series."""
     val = _get(row, col, default)
     try:
         return float(val)
@@ -107,19 +88,12 @@ def _num(row: pd.Series, col: str, default: float = 0.0) -> float:
 
 
 def _pct(valor: float) -> str:
-    """Formatea un decimal como porcentaje con 1 decimal."""
     return f"{valor * 100:.1f}%"
 
 
-# ── CARGA Y FILTRADO DEL EXCEL ───────────────────────────────────────────────────
+#---------------- CARGA Y FILTRADO DEL EXCEL ────────────────────────────────────────────────────────────────
 
 def _cargar_boletas(excel_path: str, id_caso: str) -> tuple:
-    """
-    Carga el Excel, localiza el cliente por ID de incidente y retorna:
-        df_cliente   — hasta MAX_BOLETAS boletas del cliente, ordenadas desc.
-        df_reclamada — fila(s) marcadas como 'es boleta reclamada'
-    Lanza ValueError si el caso no existe en el Excel.
-    """
     df = pd.read_excel(excel_path)
 
     # Normalizar columna de ID a string
@@ -144,7 +118,6 @@ def _cargar_boletas(excel_path: str, id_caso: str) -> tuple:
         df_cliente["es boleta reclamada"].apply(lambda x: _bool(pd.Series([x]), 0) if not isinstance(x, bool) else x) == True
     ].copy()
 
-    # Fallback más simple y robusto
     try:
         df_reclamada = df_cliente[df_cliente["es boleta reclamada"] == True].copy()
     except Exception:
@@ -153,20 +126,14 @@ def _cargar_boletas(excel_path: str, id_caso: str) -> tuple:
     return df_cliente, df_reclamada
 
 
-# ── CONTROLES PREVIOS CP01-CP10 ───────────────────────────────────────────────────
+# ── CONTROLES PREVIOS CP01-CP10 ────────────────────────────────────────────────────────────────
 
 def _controles_previos(df_cliente: pd.DataFrame, df_reclamada: pd.DataFrame) -> dict:
-    """
-    Evalúa los 10 controles de calidad y exclusión.
-    Cada resultado incluye: ok (bool), detalle (descripción técnica),
-    valores_observados (dict con los datos reales leídos) y accion (qué ocurre si falla).
-    CP10 se inicializa aquí y se actualiza tras evaluar perfiles.
-    """
     cp = {}
     n_rec = len(df_reclamada)
     r = df_reclamada.iloc[0] if n_rec > 0 else None
 
-    # ── CP01 — Documento reclamado inequívoco ────────────────────────────────────
+    # CP01: Documento reclamado inequívoco
     cp["CP01"] = {
         "ok": n_rec == 1,
         "nombre": "Documento reclamado inequívoco",
@@ -182,7 +149,7 @@ def _controles_previos(df_cliente: pd.DataFrame, df_reclamada: pd.DataFrame) -> 
         "accion_si_falla": "BLOQUEADO_POR_CONTROL — no se puede continuar sin documento objetivo único.",
     }
 
-    # ── CP02 — Tipo documental válido ────────────────────────────────────────────
+    # CP02: Tipo documental válido
     if n_rec > 0:
         tipo_doc = str(_get(r, "tipodocumento_texto", "sin dato")).lower()
         ok_cp02  = tipo_doc in ("boleta", "factura")
@@ -206,7 +173,7 @@ def _controles_previos(df_cliente: pd.DataFrame, df_reclamada: pd.DataFrame) -> 
         "accion_si_falla": "BLOQUEADO_POR_CONTROL — notas de crédito/débito no son el período principal.",
     }
 
-    # ── CP03 — Deduplicación por doc_key ────────────────────────────────────────
+    # CP03 Deduplicación por doc_key 
     dup_count = int(df_cliente.duplicated(subset=["doc_key"]).sum())
     docs_dup  = df_cliente[df_cliente.duplicated(subset=["doc_key"], keep=False)]["doc_key"].unique().tolist()
 
@@ -227,7 +194,7 @@ def _controles_previos(df_cliente: pd.DataFrame, df_reclamada: pd.DataFrame) -> 
         "accion_si_falla": "BLOQUEADO_POR_CONTROL — duplicados distorsionan indicadores.",
     }
 
-    # ── CP04 — CNR ───────────────────────────────────────────────────────────────
+    # CP04 CNR 
     if n_rec > 0:
         abono_cnr = _bool(r, "abono_cnr")
         monto_cnr = _num(r, "monto_cnr")
@@ -251,7 +218,7 @@ def _controles_previos(df_cliente: pd.DataFrame, df_reclamada: pd.DataFrame) -> 
         "accion_si_falla": "BLOQUEADO_POR_CONTROL — derivar a flujo CNR (CP04).",
     }
 
-    # ── CP05 — Calidad OCR ───────────────────────────────────────────────────────
+    # CP05 — Calidad OCR 
     if n_rec > 0:
         score_ocr = _num(r, "calidad_score")
         ok_cp05   = score_ocr >= Q_MIN
@@ -275,7 +242,7 @@ def _controles_previos(df_cliente: pd.DataFrame, df_reclamada: pd.DataFrame) -> 
         "accion_si_falla": "BLOQUEADO_POR_CONTROL — derivar a experto para revisión manual de boleta.",
     }
 
-    # ── CP06 — Historial suficiente ──────────────────────────────────────────────
+    # CP06 Historial suficiente 
     boletas_validas = df_cliente[
         df_cliente["tipodocumento_texto"].str.lower().isin(["boleta", "factura"])
     ]
@@ -298,7 +265,7 @@ def _controles_previos(df_cliente: pd.DataFrame, df_reclamada: pd.DataFrame) -> 
         "accion_si_falla": "DERIVAR — marcar regla como NO_EVALUABLE por falta de historial.",
     }
 
-    # ── CP07 — Variables críticas sin nulos ──────────────────────────────────────
+    # CP07 Variables críticas sin nulos 
     vars_criticas = [
         "consumo_total", "dias_facturacion", "tipodocumento_texto",
         "fechaemision", "montototal_doc",
@@ -327,7 +294,7 @@ def _controles_previos(df_cliente: pd.DataFrame, df_reclamada: pd.DataFrame) -> 
         "accion_si_falla": "DERIVAR — marcar NO_EVALUABLE por variable(s) crítica(s) ausente(s).",
     }
 
-    # ── CP08 — Medidores ─────────────────────────────────────────────────────────
+    # CP08 Medidores 
     if n_rec > 0:
         n_med      = _num(r, "num_medidores_distintos")
         cambio_med = _bool(r, "flag_cambio_medidor")
@@ -355,7 +322,7 @@ def _controles_previos(df_cliente: pd.DataFrame, df_reclamada: pd.DataFrame) -> 
         "accion_si_falla": "DERIVAR — cambio de medidor invalida comparaciones históricas.",
     }
 
-    # ── CP09 — Ciclo de facturación dentro de rango operacional ─────────────────
+    # CP09 Ciclo de facturación dentro de rango operacional 
     if n_rec > 0:
         dias_fac = _num(r, "dias_facturacion")
         ok_cp09  = 15.0 <= dias_fac <= 95.0
@@ -379,7 +346,7 @@ def _controles_previos(df_cliente: pd.DataFrame, df_reclamada: pd.DataFrame) -> 
         "accion_si_falla": "DERIVAR — ciclo extremo requiere revisión de extracción.",
     }
 
-    # ── CP10 — Conflicto inter-tipología (se actualiza tras evaluar perfiles) ────
+    # CP10 — Conflicto inter-tipología (se actualiza tras evaluar perfiles)   
     cp["CP10"] = {
         "ok": True,
         "nombre": "Sin conflicto inter-tipología",
@@ -391,14 +358,10 @@ def _controles_previos(df_cliente: pd.DataFrame, df_reclamada: pd.DataFrame) -> 
     return cp
 
 
-# ── EVALUACIÓN DE PERFILES C1-C14 ────────────────────────────────────────────────
+# ── EVALUACIÓN DE PERFILES C1-C14 ────────────────────────────────────────────────────────────────                         
 
 def _evaluar_perfiles(df_cliente: pd.DataFrame, df_reclamada: pd.DataFrame,
                       tipologia: str) -> dict:
-    """
-    Evalúa los 14 perfiles sobre la boleta reclamada.
-    Retorna dict {codigo: {activo, rol, condiciones, detalle}}.
-    """
     if len(df_reclamada) == 0:
         return {}
 
@@ -410,7 +373,7 @@ def _evaluar_perfiles(df_cliente: pd.DataFrame, df_reclamada: pd.DataFrame,
 
     perfiles = {}
 
-    # ── T1 — FACTURACIÓN PROVISORIA ─────────────────────────────────────────────
+    #   T1 — FACTURACIÓN PROVISORIA                       ─
 
     # C1: 3+ períodos sin lectura Y el último también es estimado
     c1_tres_sin    = b("flag_tres_o_mas_sin_lectura")
@@ -512,7 +475,7 @@ def _evaluar_perfiles(df_cliente: pd.DataFrame, df_reclamada: pd.DataFrame,
         ),
     }
 
-    # ── T2 — FACTURACIÓN EXCESIVA ────────────────────────────────────────────────
+    # T2 — FACTURACIÓN EXCESIVA                         
 
     lectura_real = not b("flag_sin_lectura")
 
@@ -623,7 +586,7 @@ def _evaluar_perfiles(df_cliente: pd.DataFrame, df_reclamada: pd.DataFrame,
         ),
     }
 
-    # ── T3 — COBROS INDEBIDOS — INTERESES ────────────────────────────────────────
+    # T3 — COBROS INDEBIDOS — INTERESES                     
 
     # C11: Tiene intereses + tasa alta (siempre revisión experta)
     c11_int    = b("tiene_interes")
@@ -670,7 +633,7 @@ def _evaluar_perfiles(df_cliente: pd.DataFrame, df_reclamada: pd.DataFrame,
         ),
     }
 
-    # ── T4 — ERROR DE LECTURA ────────────────────────────────────────────────────
+    # T4 — ERROR DE LECTURA                           
 
     # C13: Período irregular + lectura real + variación ≤30% vs promedio + consumo >0
     c13_irr    = b("flag_periodo_irregular")
@@ -724,14 +687,9 @@ def _evaluar_perfiles(df_cliente: pd.DataFrame, df_reclamada: pd.DataFrame,
     return perfiles
 
 
-# ── PRIORIDAD INTRA-TIPOLOGÍA ────────────────────────────────────────────────────
+# PRIORIDAD INTRA-TIPOLOGÍA                           
 
 def _seleccionar_perfil(perfiles: dict, tipologia: str):
-    """
-    Aplica reglas de prioridad (Sección 9) sobre los perfiles activos
-    de la tipología propuesta.
-    Retorna (perfil_principal, modificadores, alertas).
-    """
     activos = {
         k for k, v in perfiles.items()
         if v["activo"] and PERFIL_TIPOLOGIA.get(k) == tipologia
@@ -775,10 +733,9 @@ def _seleccionar_perfil(perfiles: dict, tipologia: str):
     return perfil_principal, modificadores, alertas
 
 
-# ── CONFLICTOS INTER-TIPOLOGÍA (CP10) ────────────────────────────────────────────
+# CONFLICTOS INTER-TIPOLOGÍA (CP10)                    
 
 def _evaluar_conflictos(perfiles: dict, tipologia: str):
-    """Detecta perfiles activos de tipologías distintas a la propuesta."""
     otras = {
         k for k, v in perfiles.items()
         if v["activo"] and PERFIL_TIPOLOGIA.get(k) != tipologia
@@ -795,13 +752,9 @@ def _evaluar_conflictos(perfiles: dict, tipologia: str):
     return False, "Sin conflictos — todos los perfiles activos corresponden a la tipología propuesta."
 
 
-# ── ÍNDICE DE SEVERIDAD ──────────────────────────────────────────────────────────
+# ÍNDICE DE SEVERIDAD                              
 
 def _calcular_severidad(df_reclamada: pd.DataFrame) -> tuple:
-    """
-    Calcula el índice de severidad y retorna (score, detalle_familias).
-    Regla: dentro de cada familia solo suma la condición de mayor peso.
-    """
     if len(df_reclamada) == 0:
         return 0, {}
 
@@ -912,10 +865,9 @@ def _banda_severidad(score: int) -> str:
     return "Crítica"
 
 
-# ── TEXTO DE PRERRESOLUCIÓN ───────────────────────────────────────────────────────
+# TEXTO DE PRERRESOLUCIÓN                            ─
 
 def _construir_texto(perfil: str, df_reclamada: pd.DataFrame, modificadores: list) -> str:
-    """Plantillas cerradas (Sección 12.1). Solo hechos observables y cálculos reproducibles."""
     if len(df_reclamada) == 0 or perfil is None:
         return ""
 
@@ -981,7 +933,7 @@ def _construir_texto(perfil: str, df_reclamada: pd.DataFrame, modificadores: lis
     return texto
 
 
-# ── RESUMEN EJECUTIVO ─────────────────────────────────────────────────────────────
+# RESUMEN EJECUTIVO                               ─
 
 def _resumen_ejecutivo(
     estado: str, tipologia: str, confianza: float,
@@ -991,10 +943,6 @@ def _resumen_ejecutivo(
     causas_derivacion: list, texto_pre: str,
     datos_extractor: dict, df_reclamada: pd.DataFrame,
 ) -> str:
-    """
-    Genera un resumen ejecutivo legible en consola con todos los
-    controles, perfiles evaluados y decisión final.
-    """
     SEP  = "=" * 65
     sep2 = "-" * 65
     lin  = []
@@ -1004,7 +952,7 @@ def _resumen_ejecutivo(
     add("  RESUMEN EJECUTIVO — LECTOR DE BOLETAS")
     add(SEP)
 
-    # ── Identificación del caso ──────────────────────────────────────────────────
+    #   Identificación del caso                          
     add("\n[ CASO ]")
     add(f"  ID de incidente : {datos_extractor.get('id', 'N/D')}")
     add(f"  N° referencia   : {datos_extractor.get('n_referencia', 'N/D')}")
@@ -1021,12 +969,12 @@ def _resumen_ejecutivo(
             f"| Días facturación: {int(_num(r, 'dias_facturacion'))}")
         add(f"  Monto total     : ${_num(r, 'montototal_doc'):,.0f}")
 
-    # ── Clasificador textual ─────────────────────────────────────────────────────
+    #   Clasificador textual                           ─
     add(f"\n[ CLASIFICADOR TEXTUAL ]")
     add(f"  Tipología propuesta : {tipologia} — {TIPOLOGIA_NOMBRE.get(tipologia, '?')}")
     add(f"  Confianza           : {_pct(confianza)}")
 
-    # ── Controles previos ────────────────────────────────────────────────────────
+    #   Controles previos                             
     add(f"\n[ CONTROLES PREVIOS ]")
     for cod, info in cp.items():
         icono  = "✓" if info["ok"] else "✗"
@@ -1036,7 +984,7 @@ def _resumen_ejecutivo(
         if not info["ok"]:
             add(f"       ⚠ Acción: {info.get('accion_si_falla', 'Ver especificación.')}")
 
-    # ── Perfiles evaluados ────────────────────────────────────────────────────────
+    #   Perfiles evaluados                             
     add(f"\n[ PERFILES C1-C14 EVALUADOS ]")
     perfiles_activos = [k for k, v in perfiles.items() if v["activo"]]
     for cod in ["C1","C2","C3","C4","C5","C6","C7","C8","C9","C10","C11","C12","C13","C14"]:
@@ -1047,7 +995,7 @@ def _resumen_ejecutivo(
         add(f"  {icono} {cod} {'[ACTIVO]' if info['activo'] else '[inactivo]'} — {info['rol']}")
         add(f"       {info['detalle']}")
 
-    # ── Conflictos inter-tipología ────────────────────────────────────────────────
+    #   Conflictos inter-tipología                         
     add(f"\n[ PERFILES ACTIVOS TOTALES ]")
     if perfiles_activos:
         for p in perfiles_activos:
@@ -1056,20 +1004,20 @@ def _resumen_ejecutivo(
     else:
         add("  (ninguno)")
 
-    # ── Severidad ────────────────────────────────────────────────────────────────
+    #   Severidad                                 
     add(f"\n[ ÍNDICE DE SEVERIDAD ]")
     add(f"  Score total : {sev} puntos → Banda: {banda_sev}")
     for familia, detalle in familias_sev.items():
         if detalle["puntos"] > 0:
             add(f"  + {detalle['puntos']:2d} pt — {familia}: {detalle['descripcion']}")
 
-    # ── Selección de perfil ───────────────────────────────────────────────────────
+    #   Selección de perfil                            ─
     add(f"\n[ SELECCIÓN DE PERFIL ]")
     add(f"  Perfil principal : {perfil_principal or '(ninguno)'}")
     add(f"  Modificadores    : {modificadores or '(ninguno)'}")
     add(f"  Alertas activas  : {alertas or '(ninguno)'}")
 
-    # ── Decisión final ────────────────────────────────────────────────────────────
+    #   Decisión final                               
     add(f"\n[ DECISIÓN FINAL ]")
     add(f"  Estado : {estado}")
     if causas_derivacion:
@@ -1088,7 +1036,7 @@ def _resumen_ejecutivo(
     return "\n".join(lin)
 
 
-# ── FUNCIÓN PRINCIPAL ─────────────────────────────────────────────────────────────
+# FUNCIÓN PRINCIPAL                               ─
 
 def analizar(
     datos_extractor: dict,
@@ -1113,7 +1061,7 @@ def analizar(
     """
     id_caso = str(datos_extractor.get("id", "")).strip()
 
-    # ── 1. Cargar boletas ────────────────────────────────────────────────────────
+    #   1. Cargar boletas                             
     try:
         df_cliente, df_reclamada = _cargar_boletas(excel_path, id_caso)
     except ValueError as e:
@@ -1129,7 +1077,7 @@ def analizar(
             "causal_derivacion": msg,
         }
 
-    # ── 2. Normalizar tipología ──────────────────────────────────────────────────
+    #   2. Normalizar tipología                          
     tipo_raw  = str(clasificacion_textual.get("clasificacion", "")).strip().lower()
     confianza = _num(pd.Series({"v": clasificacion_textual.get("factor_de_confianza", 0)}), "v")
     tipologia = TIPOLOGIA_MAP.get(tipo_raw, "T5")
@@ -1156,7 +1104,7 @@ def analizar(
             "resumen_ejecutivo": resumen, "causal_derivacion": causal,
         }
 
-    # ── 3. Controles previos CP01-CP09 ───────────────────────────────────────────
+    #   3. Controles previos CP01-CP09                      ─
     cp = _controles_previos(df_cliente, df_reclamada)
     causas_derivacion = []
 
@@ -1188,10 +1136,10 @@ def analizar(
                 f"{cod} ({cp[cod]['nombre']}): {cp[cod]['detalle']}"
             )
 
-    # ── 4. Evaluación de perfiles ────────────────────────────────────────────────
+    #   4. Evaluación de perfiles                         
     perfiles = _evaluar_perfiles(df_cliente, df_reclamada, tipologia)
 
-    # ── 5. Conflictos inter-tipología → CP10 ────────────────────────────────────
+    #   5. Conflictos inter-tipología → CP10                   
     hay_conflicto, detalle_conflicto = _evaluar_conflictos(perfiles, tipologia)
     perfiles_activos_otros = {
         k for k, v in perfiles.items()
@@ -1210,10 +1158,10 @@ def analizar(
     if hay_conflicto:
         causas_derivacion.append(f"CP10: {detalle_conflicto}")
 
-    # ── 6. Selección de perfil ───────────────────────────────────────────────────
+    #   6. Selección de perfil                          ─
     perfil_principal, modificadores, alertas = _seleccionar_perfil(perfiles, tipologia)
 
-    # ── 7. Verificar señal compatible ────────────────────────────────────────────
+    #   7. Verificar señal compatible                       
     activos_tipologia = {
         k for k, v in perfiles.items()
         if v["activo"] and PERFIL_TIPOLOGIA.get(k) == tipologia
@@ -1241,11 +1189,11 @@ def analizar(
             "resumen_ejecutivo": resumen, "causal_derivacion": causal,
         }
 
-    # ── 8. Severidad ─────────────────────────────────────────────────────────────
+    #   8. Severidad                               ─
     sev, familias = _calcular_severidad(df_reclamada)
     banda_sev = _banda_severidad(sev)
 
-    # ── 9. Estado final ──────────────────────────────────────────────────────────
+    #   9. Estado final                              
     if causas_derivacion:
         estado = "CLASIFICADO_PARA_REVISION"
     elif perfil_principal is None:
@@ -1270,12 +1218,12 @@ def analizar(
     else:
         estado = "VALIDADO_PARA_DESPACHO"
 
-    # ── 10. Texto de prerresolución ───────────────────────────────────────────────
+    #   10. Texto de prerresolución                        ─
     texto_pre = ""
     if estado == "VALIDADO_PARA_DESPACHO":
         texto_pre = _construir_texto(perfil_principal, df_reclamada, modificadores)
 
-    # ── 11. Reporte operacional (para auditoría) ──────────────────────────────────
+    #   11. Reporte operacional (para auditoría)                  
     reporte_op: dict = {
         "id_caso":              id_caso,
         "empresa":              datos_extractor.get("empresa"),
@@ -1306,7 +1254,7 @@ def analizar(
             "calidad_score":            _num(r, "calidad_score"),
         })
 
-    # ── 12. Resumen ejecutivo ─────────────────────────────────────────────────────
+    #   12. Resumen ejecutivo                           ─
     resumen = _resumen_ejecutivo(
         estado, tipologia, confianza,
         perfil_principal, modificadores, alertas,
@@ -1332,18 +1280,3 @@ def analizar(
         "resumen_ejecutivo":    resumen,
         "causal_derivacion":    "; ".join(causas_derivacion) if causas_derivacion else "",
     }
-
-
-# ── EJECUCIÓN DIRECTA ─────────────────────────────────────────────────────────────
-
-if __name__ == "__main__":
-    import json
-    from Extractor    import extraer,   ID_CASO, ID_PENDIENTES
-    from Clasificador import clasificar
-
-    datos_caso    = extraer(id_caso=ID_CASO, id_pendientes=ID_PENDIENTES)
-    clasificacion = clasificar(datos_caso)
-    reporte       = analizar(datos_caso, clasificacion)
-
-    print("\nReporte JSON completo:")
-    print(json.dumps(reporte, ensure_ascii=False, indent=2, default=str))

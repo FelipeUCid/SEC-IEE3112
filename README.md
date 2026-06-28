@@ -20,7 +20,6 @@ Incluye una interfaz gráfica de escritorio (`main.py`, PyQt5) para ejecutar el 
   - [Instalación](#instalación)
   - [Estructura del proyecto](#estructura-del-proyecto)
   - [Configuración de credenciales](#configuración-de-credenciales)
-  - [Uso por consola](#uso-por-consola)
   - [Uso con interfaz gráfica](#uso-con-interfaz-gráfica)
   - [Módulo `Extractor.py`](#módulo-extractorpy)
   - [Módulo `Clasificador.py`](#módulo-clasificadorpy)
@@ -95,27 +94,6 @@ SEC_PASSWORD = "TU_CONTRASEÑA"     # Reemplazar
 CLASIFICADOR_API_KEY = "TU_API_KEY"     # Reemplazar
 ```
 ---
-
-## Uso por consola
-
-```bash
-python main.py
-```
-
-Esto ejecuta las tres etapas en secuencia e imprime en consola:
-
-1. El caso extraído desde SEC (ID, referencia, fecha, empresa, categoría).
-2. La clasificación textual de IA (tipología propuesta, confianza, justificación).
-3. El resumen ejecutivo del lector de boletas (controles previos, perfiles evaluados, severidad, estado final y prerresolución si aplica).
-
-Para apuntar a un caso distinto al definido por defecto, edita en `Extractor.py`:
-```python
-ID_REFERENCIA = "260128-000718"     # N° de referencia SEC del caso a procesar
-ID_PENDIENTES = 105111              # ID del reporte de pendientes en SEC
-```
-
----
-
 ## Uso con interfaz gráfica
 
 ```bash
